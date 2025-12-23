@@ -1,78 +1,83 @@
 from __future__ import annotations
+
+import re
 from typing import Dict, List, Tuple
+
 from .utils import clean_text
 
-# Diccionarios simples (ajustables en UI si quieres)
-TREND_MAP = {
-    "GenAI/LLM": ["genai", "generative ai", "llm", "gpt", "foundation model"],
-    "Cloud": ["cloud", "aws", "azure", "gcp", "kubernetes"],
-    "Sovereign Cloud": ["sovereign", "sovereignty", "data residency", "gaia-x"],
-    "Cyber": ["cyber", "security", "ransomware", "zero trust"],
-    "Regulation": ["regulation", "regulatory", "compliance", "gdpr", "ai act"],
-    "Data": ["data platform", "lakehouse", "analytics", "governance"],
+
+TREND_MAP: Dict[str, List[str]] = {
+    "GenAI": ["genai", "generative ai", "llm", "foundation model", "copilot"],
+    "Ciberseguridad": ["cyber", "ransomware", "zero trust", "security", "niso", "iso 27001"],
+    "Cloud & Data": ["cloud", "data platform", "lakehouse", "databricks", "snowflake", "azure", "aws", "gcp"],
+    "Soberanía / Regulación": ["sovereign", "sovereignty", "sovereign cloud", "dora", "nis2", "gdpr", "regulation"],
 }
 
-MARKET_MAP = {
-    "Financial Services": ["bank", "banking", "fintech", "insurance", "payments"],
-    "Public Sector": ["government", "public sector", "ministry", "agency", "municipal"],
-    "Health": ["hospital", "healthcare", "pharma", "clinical"],
-    "Industrial": ["manufacturing", "automotive", "energy", "utilities"],
+MARKET_MAP: Dict[str, List[str]] = {
+    "Banca": ["bank", "banking", "fintech", "payments"],
+    "Seguros": ["insurance", "insurer"],
+    "Sector Público": ["public sector", "government", "ministry", "municipal"],
+    "Energía": ["energy", "utilities", "grid"],
 }
 
-SERVICE_MAP = {
-    "Strategy & Consulting": ["strategy", "operating model", "transformation", "cost", "target operating model"],
-    "Cloud": ["cloud", "migration", "landing zone", "platform engineering"],
-    "Data/AI": ["data", "ai", "ml", "genai", "analytics"],
-    "Security": ["security", "cyber", "iam", "soc", "zero trust"],
+SERVICE_MAP: Dict[str, List[str]] = {
+    "Strategy & Consulting": ["strategy", "consulting", "operating model", "transformation"],
+    "Technology": ["implementation", "migration", "platform", "architecture"],
+    "Security": ["security", "soc", "iam", "zero trust"],
+    "Managed Services": ["managed services", "outsourcing", "run", "operate"],
 }
 
-# Heurística muy simple de alcance
-GLOBAL_HINTS = ["global", "worldwide", "international", "eu", "europe", "united states", "usa", "asia"]
 
-def _match_categories(text: str, mapping: Dict[str, List[str]]) -> List[str]:
-    hits = []
-    for k, terms in mapping.items():
-        for t in terms:
-            if t in text:
-                hits.append(k)
-                break
-    return hits
+def _hits(text: str, terms: List[str]) -> int:
+    t = text.lower()
+    n = 0
+    for term in terms:
+        term = term.lower().strip()
+        if not term:
+            continue
+        if len(term) <= 4:
+            if re.search(rf"\b{re.escape(term)}\b", t):
+                n += 1
+        else:
+            if term in t:
+                n += 1
+    return n
 
-def classify(news: Dict) -> Dict:
-    title = clean_text(news.get("title", "")).lower()
-    summary = clean_text(news.get("summary", "")).lower()
-    text = f"{title} {summary}"
 
-    trends = _match_categories(text, TREND_MAP)
-    markets = _match_categories(text, MARKET_MAP)
-    services = _match_categories(text, SERVICE_MAP)
+def classify(title: str, summary: str) -> Dict[str, List[str]]:
+    text = clean_text(f"{title} {summary}")
+    out: Dict[str, List[str]] = {"trends": [], "markets": [], "services": []}
 
-    scope = "Regional/Local"
-    if any(h in text for h in GLOBAL_HINTS):
-        scope = "Global"
+    for k, terms in TREND_MAP.items():
+        if _hits(text, terms) > 0:
+            out["trends"].append(k)
 
-    return {
-        "trends": trends or ["Other"],
-        "markets": markets or ["Unknown"],
-        "services": services or ["Unknown"],
-        "scope": scope,
-    }
+    for k, terms in MARKET_MAP.items():
+        if _hits(text, terms) > 0:
+            out["markets"].append(k)
 
-def hard_filter(news: Dict, must_have_any: List[str], max_age_days: int | None = None) -> Tuple[bool, str]:
-    """
-    Returns (keep?, reason_if_dropped)
-    must_have_any: terms that must appear in title+summary
-    """
-    title = clean_text(news.get("title", "")).lower()
-    summary = clean_text(news.get("summary", "")).lower()
-    text = f"{title} {summary}"
+    for k, terms in SERVICE_MAP.items():
+        if _hits(text, terms) > 0:
+            out["services"].append(k)
 
-    if not title and not summary:
-        return False, "Sin contenido"
+    return out
 
-    if must_have_any:
-        if not any(t.lower() in text for t in must_have_any):
-            return False, "No cumple términos mínimos"
 
-    # max_age_days se evalúa en scoring.py (days_ago); aquí lo dejamos opcional si quieres endurecer
-    return True, ""
+def hard_filter(title: str, summary: str, must_terms: List[str]) -> Tuple[bool, List[str]]:
+    """Return (passes, matched_terms)."""
+    if not must_terms:
+        return True, []
+    text = clean_text(f"{title} {summary}").lower()
+    matched: List[str] = []
+    for term in must_terms:
+        term = term.strip()
+        if not term:
+            continue
+        tl = term.lower()
+        if len(tl) <= 4:
+            ok = re.search(rf"\b{re.escape(tl)}\b", text) is not None
+        else:
+            ok = tl in text
+        if ok:
+            matched.append(term)
+    return (len(matched) > 0), matched
