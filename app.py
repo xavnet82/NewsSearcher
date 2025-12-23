@@ -1,3 +1,4 @@
+# app.py
 from __future__ import annotations
 
 import uuid
@@ -49,6 +50,12 @@ def card(title: str, body_html: str) -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+def bullets(items: List[str]) -> str:
+    if not items:
+        return "—"
+    return "<br/>".join([f"• {st._utils.escape_markdown(str(x)).replace('\\n',' ')}" for x in items])  # safe-ish
 
 
 def build_google_news_rss_urls(queries: List[str], hl: str, gl: str, ceid: str) -> List[str]:
@@ -152,6 +159,9 @@ st.sidebar.subheader("LLM (opcional)")
 use_llm = st.sidebar.checkbox("Generar insights con LLM (requiere OPENAI_API_KEY)", value=False)
 st.sidebar.caption(f"LLM disponible: {'Sí' if llm_available() else 'No'}")
 
+# Control de coste/latencia
+MAX_LLM_CALLS = st.sidebar.slider("Máx llamadas LLM por ejecución", 0, 20, 5, 1)
+
 run_agent = st.sidebar.button("▶ Run Agent", type="primary")
 
 
@@ -178,11 +188,14 @@ if uploaded and st.button("📚 Construir / Re-construir índice KX", type="seco
     if not all_chunks:
         st.error("No se extrajo texto de los PDFs. (¿Son escaneados? En ese caso se requeriría OCR.)")
     else:
-        meta = build_kx_index(
-            chunks=[{"chunk_id": c["chunk_id"], "page": c["page"], "text": c["text"]} for c in all_chunks],
-            doc_name="KX_MULTI_PDF",
-        )
-        st.success(f"Índice KX construido. Chunks: {meta['chunks']} · Dim: {meta['dim']}")
+        try:
+            meta = build_kx_index(
+                chunks=[{"chunk_id": c["chunk_id"], "page": c["page"], "text": c["text"]} for c in all_chunks],
+                doc_name="KX_MULTI_PDF",
+            )
+            st.success(f"Índice KX construido. Backend: {meta.get('backend','?')} · Chunks: {meta.get('chunks')}")
+        except Exception as e:
+            st.error(f"Error construyendo índice KX: {e}")
 
 st.divider()
 
@@ -220,8 +233,8 @@ def normalize_and_store(news_items: List[Dict[str, Any]]) -> List[Dict[str, Any]
 
 
 def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    MAX_LLM_CALLS = 5
-    llm_calls = 0   # ← DEFINICIÓN CORRECTA AQUÍ
+    llm_calls = 0  # <-- IMPORTANTE: dentro de la función
+
     diag: Dict[str, Any] = {
         "rss_feeds_count": len(rss_feeds),
         "google_news_enabled": bool(use_gnews),
@@ -238,6 +251,8 @@ def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "must_terms": must_terms,
         "use_llm": bool(use_llm),
         "llm_available": bool(llm_available()),
+        "max_llm_calls": int(MAX_LLM_CALLS),
+        "llm_calls_used": 0,
     }
 
     # 1) Ingesta
@@ -258,8 +273,12 @@ def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
 
     # 2) Filtrado + enriquecimiento + scoring
     results: List[Dict[str, Any]] = []
+    progress = st.progress(0.0)
 
-    for it in ingested:
+    total = max(1, len(ingested))
+    for idx, it in enumerate(ingested):
+        progress.progress(min(1.0, (idx + 1) / total))
+
         keep, drop_reason = hard_filter(it, must_have_any=must_terms)
         if not keep:
             diag["dropped_after_filter"] += 1
@@ -267,11 +286,14 @@ def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             continue
 
         diag["kept_after_filter"] += 1
-
         query = f"{it.get('title','')} {it.get('summary','')}".strip()
 
-        # KX enrichment
-        kx_hits = search_kx(query, top_k=top_k_kx) if kx_index_exists() else []
+        # KX enrichment (no tumbar el run)
+        try:
+            kx_hits = search_kx(query, top_k=top_k_kx) if kx_index_exists() else []
+        except Exception as e:
+            diag["kx_error"] = str(e)
+            kx_hits = []
 
         # Clasificación
         classif = classify(it)
@@ -290,37 +312,20 @@ def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             + 0.25 * dim_scores["service"]
         )
 
-        # Explicación estructurada (LLM o heurística)
+        # Insights (LLM limitado + fallback)
+        use_llm_now = use_llm and llm_available() and llm_calls < int(MAX_LLM_CALLS)
+
         try:
-            use_llm_now = (
-                use_llm
-                and llm_available()
-                and llm_calls < MAX_LLM_CALLS
-            )
-            
             if use_llm_now:
-                try:
-                    insights = generate_insights_llm(it, kx_hits)
-                    llm_calls += 1
-                except Exception as e:
-                    insights = generate_insights_heuristic(it, kx_hits)
+                insights = generate_insights_llm(it, kx_hits)
+                llm_calls += 1
             else:
                 insights = generate_insights_heuristic(it, kx_hits)
-
         except Exception as e:
-            # Si el LLM falla, no rompemos el run; degradamos a heurístico y lo reflejamos en diag
             diag["llm_error"] = str(e)
             insights = generate_insights_heuristic(it, kx_hits)
 
-        descripcion = insights.get("descripcion", "")
-        por_que = insights.get("por_que_importa", [])
-        implicaciones = insights.get("implicaciones_para_accenture", [])
-
-        # Blindaje de tipos
-        if not isinstance(por_que, list):
-            por_que = [str(por_que)] if por_que else []
-        if not isinstance(implicaciones, list):
-            implicaciones = [str(implicaciones)] if implicaciones else []
+        diag["llm_calls_used"] = llm_calls
 
         results.append(
             {
@@ -329,15 +334,12 @@ def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
                 "components": {**base_comps, **dim_scores},
                 "classification": classif,
                 "tags": tags,
-                "output": {
-                    "descripcion_breve": descripcion,
-                    "por_que_importa": por_que,
-                    "implicaciones_para_accenture": implicaciones,
-                    "link": it.get("url"),
-                },
+                "output": insights,  # <-- IMPORTANTE: output ya incluye KX enrichment y evidencias
                 "kx_evidence": kx_hits,
             }
         )
+
+    progress.empty()
 
     results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
     return results[:top_n], diag
@@ -367,6 +369,7 @@ if run_agent:
                 "top_n": top_n,
                 "must_terms": must_terms,
                 "use_llm": use_llm,
+                "max_llm_calls": int(MAX_LLM_CALLS),
             }
 
             db.save_run(run_id, params, results)
@@ -424,59 +427,49 @@ if results:
         if item.get("url"):
             st.link_button("Abrir noticia", item["url"])
 
-        st.markdown("#### Output (resumen estructurado)")
         output = item.get("output") or {}
-        out_struct = {
-            "titulo": item.get("title", ""),
-            "descripcion_breve": output.get("descripcion_breve", ""),
-            "por_que_importa": output.get("por_que_importa", []),
-            "implicaciones_para_accenture": output.get("implicaciones_para_accenture", []),
-            "link": output.get("link") or item.get("url"),
-            "score_impacto": item.get("score", 0.0),
-        }
-        st.code(safe_json(out_struct), language="json")
+        st.markdown("#### Resumen (alineado al reto)")
+        card("Descripción breve", (output.get("descripcion_breve", "") or "—"))
 
-        # Cards: Clasificación + principales drivers del score
-        classif = item.get("classification") or {}
+        why = output.get("por_que_importa") or []
+        card("Por qué importa", bullets([str(x) for x in why]))
+
+        imp = output.get("implicaciones_para_accenture") or []
+        card("Implicaciones potenciales para Accenture", bullets([str(x) for x in imp]))
+
+        kx_enr = output.get("kx_enriquecimiento") or {}
+        kx_body = (kx_enr.get("resumen_contexto") or "").strip() or "—"
+        card("Enriquecimiento KX (contexto interno)", kx_body)
+
+        evs = kx_enr.get("evidencias") or []
+        if evs:
+            st.markdown("##### Evidencias KX citadas")
+            for e in evs:
+                st.caption(f"{e.get('doc','KX')} · page {e.get('page','?')} · sim {float(e.get('score',0.0)):.3f}")
+                st.write((e.get("snippet", "") or "")[:500])
+        else:
+            st.info("No hay evidencias KX citadas en el output (o no existe índice KX).")
+
+        # Cards: principales drivers del score
         comps = item.get("components") or {}
-
-        c1, c2 = st.columns(2)
-
-        with c1:
-            trends = classif.get("trends", [])
-            markets = classif.get("markets", [])
-            services = classif.get("services", [])
-            scope = classif.get("scope", "")
-
-            body = (
-                f"<b>Alcance:</b> {scope or '—'}<br/>"
-                f"<b>Tendencias:</b> {', '.join(trends) if trends else '—'}<br/>"
-                f"<b>Mercados:</b> {', '.join(markets) if markets else '—'}<br/>"
-                f"<b>Servicios:</b> {', '.join(services) if services else '—'}<br/>"
-            )
-            card("Clasificación", body)
-
-        with c2:
-            keys_order = ["recency", "entity", "keyword", "kx", "scope", "trend", "market", "service"]
-            lines: List[Tuple[str, float]] = []
-            for k in keys_order:
-                if k in comps:
-                    try:
-                        lines.append((k, float(comps.get(k))))
-                    except Exception:
-                        pass
-
-            lines.sort(key=lambda x: x[1], reverse=True)
-            top_lines = lines[:6]
-
-            if top_lines:
-                body = "<br/>".join([f"<b>{k}:</b> {v:.1f}" for k, v in top_lines])
-            else:
-                body = "—"
-            card("Componentes del score (top drivers)", body)
+        keys_order = ["recency", "entity", "keyword", "kx", "scope", "trend", "market", "service"]
+        lines: List[Tuple[str, float]] = []
+        for k in keys_order:
+            if k in comps:
+                try:
+                    lines.append((k, float(comps.get(k))))
+                except Exception:
+                    pass
+        lines.sort(key=lambda x: x[1], reverse=True)
+        top_lines = lines[:6]
+        if top_lines:
+            body = "<br/>".join([f"<b>{k}:</b> {v:.1f}" for k, v in top_lines])
+        else:
+            body = "—"
+        card("Componentes del score (top drivers)", body)
 
     with right:
-        st.markdown("#### Evidencias KX (top-k)")
+        st.markdown("#### Evidencias KX (top-k) recuperadas")
         kx = item.get("kx_evidence", [])
         if not kx:
             st.info("No hay evidencias KX (o el índice KX no está construido).")
@@ -504,6 +497,7 @@ else:
         st.write(f"- NewsAPI items: {diag.get('newsapi_items')}")
         st.write(f"- Ingestadas: {diag.get('ingested_total')}")
         st.write(f"- Tras filtro: {diag.get('kept_after_filter')}")
+        if diag.get("kx_error"):
+            st.error(f"KX error: {diag.get('kx_error')}")
         if diag.get("llm_error"):
             st.error(f"LLM error: {diag.get('llm_error')}")
-
