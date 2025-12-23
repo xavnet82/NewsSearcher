@@ -79,3 +79,17 @@ def score_news_item(
 
     tags = sorted(set(ent_tags[:4] + kw_tags[:4]))
     return total, comps, tags
+
+def score_dimensions_boost(classif: Dict[str, Any], boosts: Dict[str, float]) -> Dict[str, float]:
+    """
+    boosts: {"scope_global": x, "trend_match": y, ...}
+    """
+    out = {}
+    out["scope"] = 100.0 if classif.get("scope") == "Global" else 40.0
+
+    # si hay tendencias/mercados/servicios detectados sube un poco
+    out["trend"] = 80.0 if classif.get("trends") and classif["trends"] != ["Other"] else 30.0
+    out["market"] = 70.0 if classif.get("markets") and classif["markets"] != ["Unknown"] else 35.0
+    out["service"] = 70.0 if classif.get("services") and classif["services"] != ["Unknown"] else 35.0
+    return out
+
