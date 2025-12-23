@@ -32,12 +32,29 @@ st.title("Acn2Agent · Accenture News + KX (PDF)")
 st.caption("Buscar (Google News RSS) → enriquecer (KX) → filtrar → rankear → output estructurado")
 
 
-# ---------------- helper: Google News Search RSS ----------------
+# ---------------- UI helpers ----------------
+def card(title: str, body_html: str) -> None:
+    st.markdown(
+        f"""
+        <div style="
+            border: 1px solid rgba(49,51,63,0.20);
+            border-radius: 14px;
+            padding: 14px 16px;
+            margin: 8px 0;
+            background: rgba(255,255,255,0.02);
+        ">
+          <div style="font-weight: 700; font-size: 16px; margin-bottom: 8px;">{title}</div>
+          <div style="font-size: 14px; line-height: 1.45;">{body_html}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def build_google_news_rss_urls(queries: List[str], hl: str, gl: str, ceid: str) -> List[str]:
-    urls = []
+    urls: List[str] = []
     for q in queries:
         q_enc = requests.utils.quote(q)
-        # Formato de búsqueda RSS en Google News
         urls.append(f"https://news.google.com/rss/search?q={q_enc}&hl={hl}&gl={gl}&ceid={ceid}")
     return urls
 
@@ -45,17 +62,28 @@ def build_google_news_rss_urls(queries: List[str], hl: str, gl: str, ceid: str) 
 # ---------------- sidebar config ----------------
 st.sidebar.header("Configuración")
 
-# 1) Google News RSS (búsqueda) — esto es lo que suele dar resultados de "Accenture"
+# 1) Google News RSS (búsqueda)
 st.sidebar.subheader("Google News (RSS por búsqueda)")
 use_gnews = st.sidebar.checkbox("Usar Google News Search RSS", value=True)
+
 gnews_queries_txt = st.sidebar.text_area(
     "Queries (una por línea)",
-    value="Accenture\nAccenture AI\nAccenture OpenAI\nAccenture AWS\nAccenture Microsoft\nAccenture cyber security\nAccenture public sector\nAccenture banking",
-    height=160,
+    value=(
+        "Accenture\n"
+        "Accenture AI\n"
+        "Accenture generative AI\n"
+        "Accenture OpenAI\n"
+        "Accenture Microsoft\n"
+        "Accenture AWS\n"
+        "Accenture cybersecurity\n"
+        "Accenture public sector\n"
+        "Accenture banking\n"
+        "Accenture acquisition"
+    ),
+    height=170,
 )
 gnews_queries = [x.strip() for x in gnews_queries_txt.splitlines() if x.strip()]
 
-# Región/idioma Google News
 gnews_region = st.sidebar.selectbox("Región Google News", ["ES (español)", "US (english)", "GB (english)"], index=0)
 if gnews_region == "ES (español)":
     hl, gl, ceid = "es", "ES", "ES:es"
@@ -64,18 +92,14 @@ elif gnews_region == "US (english)":
 else:
     hl, gl, ceid = "en-GB", "GB", "GB:en"
 
-# 2) RSS generales (ruido útil)
+# 2) RSS generales (opcional)
 st.sidebar.subheader("RSS generales (opcional)")
 default_feeds = [
     "https://feeds.bbci.co.uk/news/business/rss.xml",
     "https://feeds.bbci.co.uk/news/technology/rss.xml",
     "https://www.theverge.com/rss/index.xml",
 ]
-feeds_text = st.sidebar.text_area(
-    "RSS feeds (uno por línea)",
-    value="\n".join(default_feeds),
-    height=120,
-)
+feeds_text = st.sidebar.text_area("RSS feeds (uno por línea)", value="\n".join(default_feeds), height=120)
 rss_feeds = [f.strip() for f in feeds_text.splitlines() if f.strip()]
 
 # 3) NewsAPI (opcional)
@@ -83,7 +107,7 @@ st.sidebar.subheader("NewsAPI (opcional)")
 use_newsapi = st.sidebar.checkbox("Usar NewsAPI", value=False)
 newsapi_query = st.sidebar.text_input(
     "NewsAPI query",
-    value="Accenture OR ACN OR (Accenture AND AI) OR (Accenture AND cloud)",
+    value="Accenture OR ACN OR (Accenture AND AI) OR (Accenture AND cloud) OR (Accenture AND consulting)",
 )
 news_limit = st.sidebar.slider("Máx noticias por fuente", 10, 200, 50, 10)
 
@@ -100,18 +124,10 @@ w_kw = st.sidebar.slider("Peso keywords", 0.0, 1.0, 0.20, 0.05)
 w_kx = st.sidebar.slider("Peso similitud KX", 0.0, 1.0, 0.30, 0.05)
 weights = {"recency": w_recency, "entity": w_entity, "keyword": w_kw, "kx": w_kx}
 
-keywords = st.sidebar.text_area(
-    "Keywords (uno por línea)",
-    value="\n".join(DEFAULT_KEYWORDS),
-    height=140,
-)
+keywords = st.sidebar.text_area("Keywords (uno por línea)", value="\n".join(DEFAULT_KEYWORDS), height=140)
 kw_list = [k.strip() for k in keywords.splitlines() if k.strip()]
 
-entities = st.sidebar.text_area(
-    "Entidades (uno por línea)",
-    value="\n".join(DEFAULT_ENTITIES),
-    height=120,
-)
+entities = st.sidebar.text_area("Entidades (uno por línea)", value="\n".join(DEFAULT_ENTITIES), height=120)
 ent_list = [e.strip() for e in entities.splitlines() if e.strip()]
 
 st.sidebar.divider()
@@ -119,14 +135,11 @@ st.sidebar.subheader("Filtros / ranking")
 top_k_kx = st.sidebar.slider("Top K evidencias KX por noticia", 1, 10, 5, 1)
 top_n = st.sidebar.slider("Top N noticias en ranking", 5, 50, 20, 5)
 
-enrich_with_url = st.sidebar.checkbox(
-    "Intentar extraer snippet desde URL si falta resumen",
-    value=True,
-)
+enrich_with_url = st.sidebar.checkbox("Intentar extraer snippet desde URL si falta resumen", value=True)
 
 # Hard filter
 st.sidebar.subheader("Filtro mínimo (hard filter)")
-st.sidebar.caption("Si se queda en 0, deja esto vacío para depurar. Con Google News suele bastar con 'Accenture'.")
+st.sidebar.caption("Si se queda en 0, deja esto vacío para depurar.")
 must_terms_txt = st.sidebar.text_area(
     "Debe contener al menos uno (uno por línea). Vacío = sin filtro.",
     value="Accenture\nACN",
@@ -172,7 +185,6 @@ if uploaded and st.button("📚 Construir / Re-construir índice KX", type="seco
         st.success(f"Índice KX construido. Chunks: {meta['chunks']} · Dim: {meta['dim']}")
 
 st.divider()
-
 
 # ---------------- Agent pipeline ----------------
 st.subheader("2) Ejecutar agente (news + KX)")
@@ -222,6 +234,8 @@ def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "drop_reasons": {},
         "kx_index_exists": bool(kx_index_exists()),
         "must_terms": must_terms,
+        "use_llm": bool(use_llm),
+        "llm_available": bool(llm_available()),
     }
 
     # 1) Ingesta
@@ -266,7 +280,7 @@ def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         # Score dimensiones
         dim_scores = score_dimensions_boost(classif, boosts={})
 
-        # Mezcla final
+        # Score final
         final_score = 0.75 * base_score + 0.25 * (
             0.25 * dim_scores["scope"]
             + 0.25 * dim_scores["trend"]
@@ -274,10 +288,15 @@ def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             + 0.25 * dim_scores["service"]
         )
 
-        # Explicación estructurada
-        if use_llm and llm_available():
-            insights = generate_insights_llm(it, kx_hits)
-        else:
+        # Explicación estructurada (LLM o heurística)
+        try:
+            if use_llm and llm_available():
+                insights = generate_insights_llm(it, kx_hits)
+            else:
+                insights = generate_insights_heuristic(it, kx_hits)
+        except Exception as e:
+            # Si el LLM falla, no rompemos el run; degradamos a heurístico y lo reflejamos en diag
+            diag["llm_error"] = str(e)
             insights = generate_insights_heuristic(it, kx_hits)
 
         descripcion = insights.get("descripcion", "")
@@ -307,7 +326,6 @@ def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             }
         )
 
-    # 3) Ranking
     results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
     return results[:top_n], diag
 
@@ -337,6 +355,7 @@ if run_agent:
                 "must_terms": must_terms,
                 "use_llm": use_llm,
             }
+
             db.save_run(run_id, params, results)
 
             st.session_state["last_results"] = results
@@ -404,11 +423,44 @@ if results:
         }
         st.code(safe_json(out_struct), language="json")
 
-        st.markdown("#### Clasificación (tendencia/alcance/mercado/servicio)")
-        st.json(item.get("classification", {}))
+        # Cards: Clasificación + principales drivers del score
+        classif = item.get("classification") or {}
+        comps = item.get("components") or {}
 
-        st.markdown("#### Componentes del score")
-        st.json(item.get("components", {}))
+        c1, c2 = st.columns(2)
+
+        with c1:
+            trends = classif.get("trends", [])
+            markets = classif.get("markets", [])
+            services = classif.get("services", [])
+            scope = classif.get("scope", "")
+
+            body = (
+                f"<b>Alcance:</b> {scope or '—'}<br/>"
+                f"<b>Tendencias:</b> {', '.join(trends) if trends else '—'}<br/>"
+                f"<b>Mercados:</b> {', '.join(markets) if markets else '—'}<br/>"
+                f"<b>Servicios:</b> {', '.join(services) if services else '—'}<br/>"
+            )
+            card("Clasificación", body)
+
+        with c2:
+            keys_order = ["recency", "entity", "keyword", "kx", "scope", "trend", "market", "service"]
+            lines: List[Tuple[str, float]] = []
+            for k in keys_order:
+                if k in comps:
+                    try:
+                        lines.append((k, float(comps.get(k))))
+                    except Exception:
+                        pass
+
+            lines.sort(key=lambda x: x[1], reverse=True)
+            top_lines = lines[:6]
+
+            if top_lines:
+                body = "<br/>".join([f"<b>{k}:</b> {v:.1f}" for k, v in top_lines])
+            else:
+                body = "—"
+            card("Componentes del score (top drivers)", body)
 
     with right:
         st.markdown("#### Evidencias KX (top-k)")
@@ -439,3 +491,6 @@ else:
         st.write(f"- NewsAPI items: {diag.get('newsapi_items')}")
         st.write(f"- Ingestadas: {diag.get('ingested_total')}")
         st.write(f"- Tras filtro: {diag.get('kept_after_filter')}")
+        if diag.get("llm_error"):
+            st.error(f"LLM error: {diag.get('llm_error')}")
+
