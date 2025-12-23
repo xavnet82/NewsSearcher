@@ -257,15 +257,14 @@ if results:
             st.link_button("Abrir noticia", item["url"])
 
         st.markdown("#### Output (estructura del agente)")
-out_struct = {
-    "titulo": item["title"],
-    **item["output"],
-    "score_impacto": item["score"],
-}
-st.code(safe_json(out_struct), language="json")
-st.markdown("#### Clasificación (tendencia/alcance/mercado/servicio)")
-st.json(item.get("classification", {}))
-
+        out_struct = {
+            "titulo": item["title"],
+            **item["output"],
+            "score_impacto": item["score"],
+        }
+        st.code(safe_json(out_struct), language="json")
+        st.markdown("#### Clasificación (tendencia/alcance/mercado/servicio)")
+        st.json(item.get("classification", {}))
         st.markdown("#### Componentes del score")
         st.json(item.get("components", {}))
 
