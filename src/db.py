@@ -1,105 +1,118 @@
 from __future__ import annotations
+
+import json
 import os
 import sqlite3
-from typing import Any, Dict, List
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
-from .utils import env, now_utc_iso, safe_json
+from .utils import env
 
-def get_db_path() -> str:
+
+def _db_path() -> str:
     path = env("DB_PATH", "data/app.db")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     return path
 
-def connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(get_db_path(), check_same_thread=False)
+
+def _connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(_db_path(), check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
 
+
 def init_db() -> None:
-    conn = connect()
-    cur = conn.cursor()
+    with _connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS news_items (
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                summary TEXT,
+                source TEXT,
+                url TEXT,
+                published_at TEXT,
+                provider TEXT,
+                raw_json TEXT
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS runs (
+                run_id TEXT PRIMARY KEY,
+                created_at TEXT,
+                params_json TEXT,
+                results_json TEXT
+            );
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_news_published_at ON news_items(published_at);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_news_provider ON news_items(provider);")
+        conn.commit()
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS news_items (
-        id TEXT PRIMARY KEY,
-        title TEXT,
-        summary TEXT,
-        source TEXT,
-        url TEXT,
-        published_at TEXT,
-        raw_json TEXT
-    )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS runs (
-        run_id TEXT PRIMARY KEY,
-        created_at TEXT,
-        params_json TEXT,
-        results_json TEXT
-    )
-    """)
-
-    conn.commit()
-    conn.close()
 
 def upsert_news(item: Dict[str, Any]) -> None:
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("""
-    INSERT INTO news_items (id, title, summary, source, url, published_at, raw_json)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(id) DO UPDATE SET
-        title=excluded.title,
-        summary=excluded.summary,
-        source=excluded.source,
-        url=excluded.url,
-        published_at=excluded.published_at,
-        raw_json=excluded.raw_json
-    """, (
-        item["id"], item.get("title"), item.get("summary"), item.get("source"),
-        item.get("url"), item.get("published_at"), safe_json(item)
-    ))
-    conn.commit()
-    conn.close()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO news_items(id, title, summary, source, url, published_at, provider, raw_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                title=excluded.title,
+                summary=excluded.summary,
+                source=excluded.source,
+                url=excluded.url,
+                published_at=excluded.published_at,
+                provider=excluded.provider,
+                raw_json=excluded.raw_json;
+            """,
+            (
+                item.get("id"),
+                item.get("title"),
+                item.get("summary"),
+                item.get("source"),
+                item.get("url"),
+                item.get("published_at"),
+                item.get("provider"),
+                json.dumps(item.get("raw", {}), ensure_ascii=False),
+            ),
+        )
+        conn.commit()
 
-def news_exists(news_id: str) -> bool:
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM news_items WHERE id = ? LIMIT 1", (news_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row is not None
 
-def list_news(limit: int = 200) -> List[Dict[str, Any]]:
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT id, title, summary, source, url, published_at, raw_json
-        FROM news_items
-        ORDER BY published_at DESC
-        LIMIT ?
-    """, (limit,))
-    rows = cur.fetchall()
-    conn.close()
-    out = []
-    for r in rows:
-        out.append({
-            "id": r["id"],
-            "title": r["title"],
-            "summary": r["summary"],
-            "source": r["source"],
-            "url": r["url"],
-            "published_at": r["published_at"],
-        })
-    return out
+def get_news(limit: int = 500) -> List[Dict[str, Any]]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM news_items ORDER BY published_at DESC LIMIT ?", (int(limit),)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
 
 def save_run(run_id: str, params: Dict[str, Any], results: List[Dict[str, Any]]) -> None:
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("""
-    INSERT INTO runs (run_id, created_at, params_json, results_json)
-    VALUES (?, ?, ?, ?)
-    """, (run_id, now_utc_iso(), safe_json(params), safe_json(results)))
-    conn.commit()
-    conn.close()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO runs(run_id, created_at, params_json, results_json)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(run_id) DO UPDATE SET
+                created_at=excluded.created_at,
+                params_json=excluded.params_json,
+                results_json=excluded.results_json;
+            """,
+            (
+                run_id,
+                datetime.now(timezone.utc).isoformat(),
+                json.dumps(params, ensure_ascii=False),
+                json.dumps(results, ensure_ascii=False),
+            ),
+        )
+        conn.commit()
+
+
+def get_run(run_id: str) -> Optional[Dict[str, Any]]:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+    return dict(row) if row else None
