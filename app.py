@@ -319,11 +319,16 @@ if results:
             st.link_button("Abrir noticia", item["url"])
 
         st.markdown("#### Output (resumen estructurado)")
+        output = item.get("output") or {}
         out_struct = {
-            "titulo": item["title"],
-            **item["output"],
-            "score_impacto": item["score"],
+            "titulo": item.get("title", ""),
+            "descripcion_breve": output.get("descripcion_breve", ""),
+            "por_que_importa": output.get("por_que_importa", []),
+            "implicaciones_para_accenture": output.get("implicaciones_para_accenture", []),
+            "link": output.get("link") or item.get("url"),
+            "score_impacto": item.get("score", 0.0),
         }
+
         st.code(safe_json(out_struct), language="json")
 
         st.markdown("#### Clasificación (tendencia/alcance/mercado/servicio)")
