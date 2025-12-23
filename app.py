@@ -4,6 +4,7 @@ import uuid
 from typing import Any, Dict, List, Tuple
 
 import pandas as pd
+import requests
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -25,18 +26,49 @@ from src.utils import clean_text, safe_json, sha1
 load_dotenv()
 db.init_db()
 
-st.set_page_config(page_title="Acn2Agent · News + KX (PDF)", layout="wide")
+st.set_page_config(page_title="Acn2Agent · Accenture News + KX (PDF)", layout="wide")
 
-st.title("Acn2Agent · News + KX (PDF)")
-st.caption("Buscar → enriquecer (KX) → filtrar → rankear → output estructurado")
+st.title("Acn2Agent · Accenture News + KX (PDF)")
+st.caption("Buscar (Google News RSS) → enriquecer (KX) → filtrar → rankear → output estructurado")
+
+
+# ---------------- helper: Google News Search RSS ----------------
+def build_google_news_rss_urls(queries: List[str], hl: str, gl: str, ceid: str) -> List[str]:
+    urls = []
+    for q in queries:
+        q_enc = requests.utils.quote(q)
+        # Formato de búsqueda RSS en Google News
+        urls.append(f"https://news.google.com/rss/search?q={q_enc}&hl={hl}&gl={gl}&ceid={ceid}")
+    return urls
+
 
 # ---------------- sidebar config ----------------
 st.sidebar.header("Configuración")
 
-# Feeds más fiables por defecto (evito Reuters por fallos frecuentes en RSS)
+# 1) Google News RSS (búsqueda) — esto es lo que suele dar resultados de "Accenture"
+st.sidebar.subheader("Google News (RSS por búsqueda)")
+use_gnews = st.sidebar.checkbox("Usar Google News Search RSS", value=True)
+gnews_queries_txt = st.sidebar.text_area(
+    "Queries (una por línea)",
+    value="Accenture\nAccenture AI\nAccenture OpenAI\nAccenture AWS\nAccenture Microsoft\nAccenture cyber security\nAccenture public sector\nAccenture banking",
+    height=160,
+)
+gnews_queries = [x.strip() for x in gnews_queries_txt.splitlines() if x.strip()]
+
+# Región/idioma Google News
+gnews_region = st.sidebar.selectbox("Región Google News", ["ES (español)", "US (english)", "GB (english)"], index=0)
+if gnews_region == "ES (español)":
+    hl, gl, ceid = "es", "ES", "ES:es"
+elif gnews_region == "US (english)":
+    hl, gl, ceid = "en-US", "US", "US:en"
+else:
+    hl, gl, ceid = "en-GB", "GB", "GB:en"
+
+# 2) RSS generales (ruido útil)
+st.sidebar.subheader("RSS generales (opcional)")
 default_feeds = [
-    "https://feeds.bbci.co.uk/news/technology/rss.xml",
     "https://feeds.bbci.co.uk/news/business/rss.xml",
+    "https://feeds.bbci.co.uk/news/technology/rss.xml",
     "https://www.theverge.com/rss/index.xml",
 ]
 feeds_text = st.sidebar.text_area(
@@ -46,10 +78,12 @@ feeds_text = st.sidebar.text_area(
 )
 rss_feeds = [f.strip() for f in feeds_text.splitlines() if f.strip()]
 
-use_newsapi = st.sidebar.checkbox("Usar NewsAPI (opcional)", value=False)
+# 3) NewsAPI (opcional)
+st.sidebar.subheader("NewsAPI (opcional)")
+use_newsapi = st.sidebar.checkbox("Usar NewsAPI", value=False)
 newsapi_query = st.sidebar.text_input(
     "NewsAPI query",
-    value="Accenture OR consulting OR artificial intelligence OR cloud regulation",
+    value="Accenture OR ACN OR (Accenture AND AI) OR (Accenture AND cloud)",
 )
 news_limit = st.sidebar.slider("Máx noticias por fuente", 10, 200, 50, 10)
 
@@ -90,41 +124,36 @@ enrich_with_url = st.sidebar.checkbox(
     value=True,
 )
 
-# Filtro mínimo (hard filter)
-st.sidebar.subheader("Filtro mínimo")
+# Hard filter
+st.sidebar.subheader("Filtro mínimo (hard filter)")
+st.sidebar.caption("Si se queda en 0, deja esto vacío para depurar. Con Google News suele bastar con 'Accenture'.")
 must_terms_txt = st.sidebar.text_area(
     "Debe contener al menos uno (uno por línea). Vacío = sin filtro.",
-    value="Accenture\ndeloitte\npwc\ney\nkpmg\naws\nazure\nopenai",
-    height=120,
+    value="Accenture\nACN",
+    height=90,
 )
 must_terms = [x.strip() for x in must_terms_txt.splitlines() if x.strip()]
 
 st.sidebar.divider()
 st.sidebar.subheader("LLM (opcional)")
-use_llm = st.sidebar.checkbox(
-    "Generar insights con LLM (requiere OPENAI_API_KEY)",
-    value=False,
-)
+use_llm = st.sidebar.checkbox("Generar insights con LLM (requiere OPENAI_API_KEY)", value=False)
 st.sidebar.caption(f"LLM disponible: {'Sí' if llm_available() else 'No'}")
 
 run_agent = st.sidebar.button("▶ Run Agent", type="primary")
+
 
 # ---------------- KX upload / build index ----------------
 st.subheader("1) Cargar KX (PDF) y construir índice")
 col1, col2 = st.columns([2, 1])
 
 with col1:
-    uploaded = st.file_uploader(
-        "Sube uno o varios PDFs (KX)",
-        type=["pdf"],
-        accept_multiple_files=True,
-    )
+    uploaded = st.file_uploader("Sube uno o varios PDFs (KX)", type=["pdf"], accept_multiple_files=True)
+
 with col2:
     st.metric("Índice KX existe", "Sí" if kx_index_exists() else "No")
 
 if uploaded and st.button("📚 Construir / Re-construir índice KX", type="secondary"):
     all_chunks: List[Dict[str, Any]] = []
-
     for f in uploaded:
         path = save_uploaded_pdf(f.getvalue(), f.name)
         pages = extract_pdf_text(path)
@@ -144,8 +173,10 @@ if uploaded and st.button("📚 Construir / Re-construir índice KX", type="seco
 
 st.divider()
 
+
 # ---------------- Agent pipeline ----------------
 st.subheader("2) Ejecutar agente (news + KX)")
+
 
 def normalize_and_store(news_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     stored: List[Dict[str, Any]] = []
@@ -175,13 +206,15 @@ def normalize_and_store(news_items: List[Dict[str, Any]]) -> List[Dict[str, Any]
         stored.append(norm)
     return stored
 
+
 def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """
-    Returns: (top_results, diagnostics)
-    """
     diag: Dict[str, Any] = {
-        "rss_feeds": rss_feeds,
+        "rss_feeds_count": len(rss_feeds),
+        "google_news_enabled": bool(use_gnews),
+        "google_news_region": {"hl": hl, "gl": gl, "ceid": ceid},
+        "google_news_queries_count": len(gnews_queries),
         "rss_items": 0,
+        "google_news_items": 0,
         "newsapi_items": 0,
         "ingested_total": 0,
         "kept_after_filter": 0,
@@ -193,12 +226,18 @@ def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
 
     # 1) Ingesta
     rss_items = fetch_rss(rss_feeds, max_items=news_limit) if rss_feeds else []
-    api_items = fetch_newsapi(newsapi_query, page_size=news_limit) if use_newsapi else []
-
     diag["rss_items"] = len(rss_items)
+
+    gnews_items: List[Dict[str, Any]] = []
+    if use_gnews and gnews_queries:
+        gnews_urls = build_google_news_rss_urls(gnews_queries, hl=hl, gl=gl, ceid=ceid)
+        gnews_items = fetch_rss(gnews_urls, max_items=news_limit)
+    diag["google_news_items"] = len(gnews_items)
+
+    api_items = fetch_newsapi(newsapi_query, page_size=news_limit) if use_newsapi else []
     diag["newsapi_items"] = len(api_items)
 
-    ingested = normalize_and_store(rss_items + api_items)
+    ingested = normalize_and_store(rss_items + gnews_items + api_items)
     diag["ingested_total"] = len(ingested)
 
     # 2) Filtrado + enriquecimiento + scoring
@@ -213,21 +252,21 @@ def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
 
         diag["kept_after_filter"] += 1
 
-        query = f"{it.get('title', '')} {it.get('summary', '')}".strip()
+        query = f"{it.get('title','')} {it.get('summary','')}".strip()
 
-        # KX enrichment (RAG)
+        # KX enrichment
         kx_hits = search_kx(query, top_k=top_k_kx) if kx_index_exists() else []
 
-        # Clasificación (tendencia/alcance/mercado/servicio)
+        # Clasificación
         classif = classify(it)
 
         # Score base
         base_score, base_comps, tags = score_news_item(it, kx_hits, weights, kw_list, ent_list)
 
-        # Score dimensiones (scope/trend/market/service)
+        # Score dimensiones
         dim_scores = score_dimensions_boost(classif, boosts={})
 
-        # Mezcla final (75% base, 25% dimensiones)
+        # Mezcla final
         final_score = 0.75 * base_score + 0.25 * (
             0.25 * dim_scores["scope"]
             + 0.25 * dim_scores["trend"]
@@ -272,10 +311,11 @@ def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
     return results[:top_n], diag
 
+
 # ---------------- Run ----------------
 if run_agent:
-    if not rss_feeds and not use_newsapi:
-        st.error("Configura al menos RSS o activa NewsAPI.")
+    if (not rss_feeds) and (not use_gnews) and (not use_newsapi):
+        st.error("Activa al menos una fuente: Google News RSS, RSS generales o NewsAPI.")
     else:
         with st.spinner("Ejecutando agente..."):
             results, diag = run_pipeline()
@@ -283,6 +323,9 @@ if run_agent:
 
             params = {
                 "rss_feeds": rss_feeds,
+                "use_gnews": use_gnews,
+                "gnews_region": {"hl": hl, "gl": gl, "ceid": ceid},
+                "gnews_queries": gnews_queries,
                 "use_newsapi": use_newsapi,
                 "newsapi_query": newsapi_query,
                 "news_limit": news_limit,
@@ -299,6 +342,7 @@ if run_agent:
             st.session_state["last_results"] = results
             st.session_state["last_run_id"] = run_id
             st.session_state["last_diag"] = diag
+
 
 # ---------------- Results UI ----------------
 results = st.session_state.get("last_results", [])
@@ -335,11 +379,7 @@ if results:
 
     st.subheader("Detalle")
     titles = [f"{i+1}. [{r.get('score', 0):.1f}] {r.get('title', '')[:110]}" for i, r in enumerate(results)]
-    idx = st.selectbox(
-        "Selecciona una noticia",
-        options=list(range(len(results))),
-        format_func=lambda i: titles[i],
-    )
+    idx = st.selectbox("Selecciona una noticia", options=list(range(len(results))), format_func=lambda i: titles[i])
 
     item = results[idx]
     left, right = st.columns([2, 1])
@@ -394,6 +434,7 @@ else:
     st.warning("No hay noticias para mostrar. Pulsa 'Run Agent' y revisa el diagnóstico.")
     if diag:
         st.write("Pistas rápidas:")
+        st.write(f"- Google News items: {diag.get('google_news_items')}")
         st.write(f"- RSS items: {diag.get('rss_items')}")
         st.write(f"- NewsAPI items: {diag.get('newsapi_items')}")
         st.write(f"- Ingestadas: {diag.get('ingested_total')}")
