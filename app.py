@@ -220,6 +220,8 @@ def normalize_and_store(news_items: List[Dict[str, Any]]) -> List[Dict[str, Any]
 
 
 def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    MAX_LLM_CALLS = 5
+    llm_calls = 0   # ← DEFINICIÓN CORRECTA AQUÍ
     diag: Dict[str, Any] = {
         "rss_feeds_count": len(rss_feeds),
         "google_news_enabled": bool(use_gnews),
