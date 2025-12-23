@@ -1,6 +1,8 @@
 from __future__ import annotations
 import uuid
 from typing import Any, Dict, List
+from src.classifier import classify, hard_filter
+from src.scoring import score_dimensions_boost
 
 import streamlit as st
 import pandas as pd
