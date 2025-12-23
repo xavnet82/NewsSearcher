@@ -178,35 +178,47 @@ def normalize_and_store(news_items: List[Dict[str, Any]]) -> List[Dict[str, Any]
         stored.append(norm)
     return stored
 
-def run_pipeline() -> List[Dict[str, Any]]:
+def run_pipeline() -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    diag: Dict[str, Any] = {
+        "rss_feeds": rss_feeds,
+        "rss_items": 0,
+        "newsapi_items": 0,
+        "ingested_total": 0,
+        "kept_after_filter": 0,
+        "dropped_after_filter": 0,
+        "drop_reasons": {},
+    }
+
     # 1) Ingesta
     rss_items = fetch_rss(rss_feeds, max_items=news_limit) if rss_feeds else []
     api_items = fetch_newsapi(newsapi_query, page_size=news_limit) if use_newsapi else []
-    ingested = normalize_and_store(rss_items + api_items)
 
-    # 2) Enriquecer + clasificar + score
+    diag["rss_items"] = len(rss_items)
+    diag["newsapi_items"] = len(api_items)
+
+    ingested = normalize_and_store(rss_items + api_items)
+    diag["ingested_total"] = len(ingested)
+
     results: List[Dict[str, Any]] = []
 
+    # 2) Filtrado + enriquecimiento + scoring
     for it in ingested:
-        keep, _drop_reason = hard_filter(it, must_have_any=must_terms)
+        keep, drop_reason = hard_filter(it, must_have_any=must_terms)
         if not keep:
+            diag["dropped_after_filter"] += 1
+            diag["drop_reasons"][drop_reason] = diag["drop_reasons"].get(drop_reason, 0) + 1
             continue
 
-        query = f"{it.get('title', '')} {it.get('summary', '')}".strip()
+        diag["kept_after_filter"] += 1
 
-        # KX enrichment (RAG)
+        query = f"{it.get('title','')} {it.get('summary','')}".strip()
+
         kx_hits = search_kx(query, top_k=top_k_kx) if kx_index_exists() else []
-
-        # Clasificación (tendencia/alcance/mercado/servicio)
         classif = classify(it)
 
-        # Score base
         base_score, base_comps, tags = score_news_item(it, kx_hits, weights, kw_list, ent_list)
-
-        # Score dimensiones (scope/trend/market/service)
         dim_scores = score_dimensions_boost(classif, boosts={})
 
-        # Mezcla final (75% base, 25% dimensiones)
         final_score = 0.75 * base_score + 0.25 * (
             0.25 * dim_scores["scope"]
             + 0.25 * dim_scores["trend"]
@@ -214,7 +226,6 @@ def run_pipeline() -> List[Dict[str, Any]]:
             + 0.25 * dim_scores["service"]
         )
 
-        # Explicación estructurada
         if use_llm and llm_available():
             insights = generate_insights_llm(it, kx_hits)
         else:
@@ -224,138 +235,28 @@ def run_pipeline() -> List[Dict[str, Any]]:
         por_que = insights.get("por_que_importa", [])
         implicaciones = insights.get("implicaciones_para_accenture", [])
 
-        results.append(
-            {
-                **it,
-                "score": float(final_score),
-                "components": {**base_comps, **dim_scores},
-                "classification": classif,
-                "tags": tags,
-                "output": {
-                    "descripcion_breve": descripcion,
-                    "por_que_importa": por_que,
-                    "implicaciones_para_accenture": implicaciones,
-                    "link": it.get("url"),
-                },
-                "kx_evidence": kx_hits,
-            }
-        )
+        # blindaje de tipos
+        if not isinstance(por_que, list):
+            por_que = [str(por_que)] if por_que else []
+        if not isinstance(implicaciones, list):
+            implicaciones = [str(implicaciones)] if implicaciones else []
+
+        results.append({
+            **it,
+            "score": float(final_score),
+            "components": {**base_comps, **dim_scores},
+            "classification": classif,
+            "tags": tags,
+            "output": {
+                "descripcion_breve": descripcion,
+                "por_que_importa": por_que,
+                "implicaciones_para_accenture": implicaciones,
+                "link": it.get("url"),
+            },
+            "kx_evidence": kx_hits,
+        })
 
     # 3) Ranking
     results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
-    return results[:top_n]
+    return results[:top_n], diag
 
-if run_agent:
-    if not rss_feeds and not use_newsapi:
-        st.error("Configura al menos RSS o activa NewsAPI.")
-    else:
-        with st.spinner("Ejecutando agente..."):
-            results = run_pipeline()
-            run_id = str(uuid.uuid4())
-
-            params = {
-                "rss_feeds": rss_feeds,
-                "use_newsapi": use_newsapi,
-                "newsapi_query": newsapi_query,
-                "news_limit": news_limit,
-                "chunk_size": chunk_size,
-                "chunk_overlap": chunk_overlap,
-                "weights": weights,
-                "top_k_kx": top_k_kx,
-                "top_n": top_n,
-                "must_terms": must_terms,
-                "use_llm": use_llm,
-            }
-            db.save_run(run_id, params, results)
-
-            st.session_state["last_results"] = results
-            st.session_state["last_run_id"] = run_id
-
-# ---------------- Results UI ----------------
-results = st.session_state.get("last_results", [])
-run_id = st.session_state.get("last_run_id", None)
-
-if results:
-    st.success(f"Run completado. run_id={run_id}")
-
-    df = pd.DataFrame(
-        [
-            {
-                "score": r["score"],
-                "title": r["title"],
-                "source": r["source"],
-                "published_at": r["published_at"],
-                "scope": r.get("classification", {}).get("scope", ""),
-                "trends": ", ".join(r.get("classification", {}).get("trends", [])),
-                "markets": ", ".join(r.get("classification", {}).get("markets", [])),
-                "services": ", ".join(r.get("classification", {}).get("services", [])),
-                "url": r["url"],
-                "provider": r.get("provider", ""),
-            }
-            for r in results
-        ]
-    )
-
-    st.subheader("Ranking")
-    st.dataframe(df, use_container_width=True, hide_index=True)
-
-    st.subheader("Detalle")
-    titles = [f"{i+1}. [{r['score']:.1f}] {r['title'][:110]}" for i, r in enumerate(results)]
-    idx = st.selectbox(
-        "Selecciona una noticia",
-        options=list(range(len(results))),
-        format_func=lambda i: titles[i],
-    )
-
-    item = results[idx]
-    left, right = st.columns([2, 1])
-
-    with left:
-        st.markdown(f"### {item['title']}")
-        st.write(
-            f"**Fuente:** {item.get('source','')}  ·  **Fecha:** {item.get('published_at','')}  ·  **Proveedor:** {item.get('provider','')}"
-        )
-        if item.get("url"):
-            st.link_button("Abrir noticia", item["url"])
-
-        st.markdown("#### Output (resumen estructurado)")
-        output = item.get("output") or {}
-        out_struct = {
-            "titulo": item.get("title", ""),
-            "descripcion_breve": output.get("descripcion_breve", ""),
-            "por_que_importa": output.get("por_que_importa", []),
-            "implicaciones_para_accenture": output.get("implicaciones_para_accenture", []),
-            "link": output.get("link") or item.get("url"),
-            "score_impacto": item.get("score", 0.0),
-        }
-
-        st.code(safe_json(out_struct), language="json")
-
-        st.markdown("#### Clasificación (tendencia/alcance/mercado/servicio)")
-        st.json(item.get("classification", {}))
-
-        st.markdown("#### Componentes del score")
-        st.json(item.get("components", {}))
-
-    with right:
-        st.markdown("#### Evidencias KX (top-k)")
-        kx = item.get("kx_evidence", [])
-        if not kx:
-            st.info("No hay evidencias KX (o el índice KX no está construido).")
-        else:
-            for h in kx:
-                st.markdown(
-                    f"**Sim:** {h.get('score', 0):.3f} · **Doc:** {h.get('doc_name', 'KX')} · **Page:** {h.get('page', '?')}"
-                )
-                st.caption((h.get("text", "") or "")[:700])
-
-    st.subheader("Export")
-    st.download_button(
-        "Descargar resultados (JSON)",
-        data=safe_json(results),
-        file_name=f"acn2agent_results_{run_id}.json",
-        mime="application/json",
-    )
-
-else:
-    st.info("Carga KX (opcional) y ejecuta el agente desde la barra lateral.")
