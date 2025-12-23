@@ -1,96 +1,230 @@
 from __future__ import annotations
-from typing import Any, Dict, List, Tuple
-import os
+
 import json
+import os
+import pickle
+from dataclasses import dataclass
+from typing import Any, Dict, List, Tuple
+
 import numpy as np
-import faiss
-from sentence_transformers import SentenceTransformer
 
-from .utils import env, clean_text
+from src.utils import clean_text, env
 
-from functools import lru_cache
-from sentence_transformers import SentenceTransformer
-from src.utils import env
+# --- Optional deps (TF-IDF fallback) ---
+_TFIDF_AVAILABLE = True
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+except Exception:
+    _TFIDF_AVAILABLE = False
 
-@lru_cache(maxsize=1)
-def get_embedder() -> SentenceTransformer:
+# --- Optional deps (SentenceTransformers) ---
+_ST_AVAILABLE = True
+try:
+    from sentence_transformers import SentenceTransformer
+except Exception:
+    _ST_AVAILABLE = False
+
+# ---------------- Paths ----------------
+def ensure_store_dir() -> str:
+    d = env("KX_STORE_DIR", "data/kx_store")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def _meta_path() -> str:
+    return os.path.join(ensure_store_dir(), "kx_meta.json")
+
+def _backend_path() -> str:
+    return os.path.join(ensure_store_dir(), "kx_backend.json")
+
+def _faiss_index_path() -> str:
+    return os.path.join(ensure_store_dir(), "kx_faiss.index")
+
+def _tfidf_path() -> str:
+    return os.path.join(ensure_store_dir(), "kx_tfidf.pkl")
+
+
+# ---------------- Backend selection ----------------
+@dataclass
+class KXBackend:
+    name: str  # "st_faiss" or "tfidf"
+    dim: int | None = None
+
+def _save_backend(b: KXBackend) -> None:
+    with open(_backend_path(), "w", encoding="utf-8") as f:
+        json.dump({"name": b.name, "dim": b.dim}, f, ensure_ascii=False, indent=2)
+
+def _load_backend() -> KXBackend | None:
+    if not os.path.exists(_backend_path()):
+        return None
+    with open(_backend_path(), "r", encoding="utf-8") as f:
+        d = json.load(f)
+    return KXBackend(name=d.get("name", "tfidf"), dim=d.get("dim"))
+
+def kx_index_exists() -> bool:
+    # Either FAISS or TFIDF artifacts must exist
+    return os.path.exists(_meta_path()) and (os.path.exists(_faiss_index_path()) or os.path.exists(_tfidf_path()))
+
+def _save_meta(meta: List[Dict[str, Any]]) -> None:
+    with open(_meta_path(), "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+def _load_meta() -> List[Dict[str, Any]]:
+    with open(_meta_path(), "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+# ---------------- Embeddings backend (SentenceTransformer + FAISS) ----------------
+def _get_embedder_cpu() -> "SentenceTransformer":
+    """
+    Carga robusta en CPU. Si el entorno fuerza 'meta' y falla, lanzará excepción.
+    """
+    if not _ST_AVAILABLE:
+        raise RuntimeError("sentence-transformers no disponible")
+
     model_name = env("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 
-    # Forzamos CPU explícitamente. Evita caminos raros de device/meta.
-    embedder = SentenceTransformer(
+    # Intento explícito en CPU. Evita GPU, evita remote code.
+    return SentenceTransformer(
         model_name,
         device="cpu",
         trust_remote_code=False,
     )
-    return embedder
 
+def _build_faiss_index(texts: List[str]) -> Tuple[Any, int]:
+    import faiss  # faiss-cpu debe estar instalado
+    embedder = _get_embedder_cpu()
 
-def ensure_faiss_dir() -> str:
-    d = env("FAISS_DIR", "data/faiss")
-    os.makedirs(d, exist_ok=True)
-    return d
+    emb = embedder.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+    emb = np.array(emb).astype("float32")
+    dim = emb.shape[1]
 
-def _index_path() -> str:
-    return os.path.join(ensure_faiss_dir(), "kx.index")
-
-def _meta_path() -> str:
-    return os.path.join(ensure_faiss_dir(), "kx_meta.json")
-
-def build_kx_index(chunks: List[Dict[str, Any]], doc_name: str) -> Dict[str, Any]:
-    embedder = get_embedder()
-    texts = [clean_text(c["text"]) for c in chunks]
-    embs = embedder.encode(texts, normalize_embeddings=True, show_progress_bar=False)
-    embs = np.array(embs).astype("float32")
-
-    dim = embs.shape[1]
     index = faiss.IndexFlatIP(dim)
-    index.add(embs)
+    index.add(emb)
+    return index, dim
 
-    faiss.write_index(index, _index_path())
+def _search_faiss(index: Any, query: str, top_k: int) -> Tuple[np.ndarray, np.ndarray]:
+    embedder = _get_embedder_cpu()
+    q = clean_text(query)
+    q_emb = embedder.encode([q], normalize_embeddings=True, show_progress_bar=False)
+    q_emb = np.array(q_emb).astype("float32")
+    scores, ids = index.search(q_emb, top_k)
+    return scores[0], ids[0]
 
-    meta = []
+def _save_faiss(index: Any) -> None:
+    import faiss
+    faiss.write_index(index, _faiss_index_path())
+
+def _load_faiss() -> Any:
+    import faiss
+    return faiss.read_index(_faiss_index_path())
+
+
+# ---------------- TF-IDF fallback backend (NO TORCH) ----------------
+def _build_tfidf(texts: List[str]) -> Dict[str, Any]:
+    if not _TFIDF_AVAILABLE:
+        raise RuntimeError("scikit-learn no disponible para TF-IDF fallback")
+
+    vectorizer = TfidfVectorizer(
+        lowercase=True,
+        max_features=80000,
+        ngram_range=(1, 2),
+        stop_words=None,
+    )
+    X = vectorizer.fit_transform(texts)
+    return {"vectorizer": vectorizer, "X": X}
+
+def _save_tfidf(obj: Dict[str, Any]) -> None:
+    with open(_tfidf_path(), "wb") as f:
+        pickle.dump(obj, f)
+
+def _load_tfidf() -> Dict[str, Any]:
+    with open(_tfidf_path(), "rb") as f:
+        return pickle.load(f)
+
+def _search_tfidf(tfidf_obj: Dict[str, Any], query: str, top_k: int) -> Tuple[np.ndarray, np.ndarray]:
+    q = clean_text(query)
+    vectorizer = tfidf_obj["vectorizer"]
+    X = tfidf_obj["X"]
+    qv = vectorizer.transform([q])
+    sims = cosine_similarity(qv, X)[0]
+    top_idx = np.argsort(-sims)[:top_k]
+    return sims[top_idx], top_idx
+
+
+# ---------------- Public API ----------------
+def build_kx_index(chunks: List[Dict[str, Any]], doc_name: str = "KX") -> Dict[str, Any]:
+    """
+    chunks: [{"chunk_id":..., "page":..., "text":...}, ...]
+    """
+    meta: List[Dict[str, Any]] = []
+    texts: List[str] = []
+
     for i, c in enumerate(chunks):
-        meta.append({
-            "i": i,
-            "doc_name": doc_name,
-            "chunk_id": c.get("chunk_id"),
-            "page": c.get("page"),
-            "text": c.get("text"),
-        })
-    with open(_meta_path(), "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
+        txt = clean_text(c.get("text", ""))
+        if not txt:
+            continue
+        meta.append(
+            {
+                "i": i,
+                "doc_name": doc_name,
+                "chunk_id": c.get("chunk_id"),
+                "page": c.get("page"),
+                "text": txt,
+            }
+        )
+        texts.append(txt)
 
-    return {"chunks": len(chunks), "dim": dim}
+    if not meta:
+        raise ValueError("No hay chunks con texto para indexar.")
 
-def kx_index_exists() -> bool:
-    return os.path.exists(_index_path()) and os.path.exists(_meta_path())
+    _save_meta(meta)
 
-def load_index() -> Tuple[faiss.Index, List[Dict[str, Any]]]:
-    index = faiss.read_index(_index_path())
-    with open(_meta_path(), "r", encoding="utf-8") as f:
-        meta = json.load(f)
-    return index, meta
+    # 1) Intento embeddings + FAISS (si está instalado y el modelo carga)
+    use_embeddings = env("KX_USE_EMBEDDINGS", "1") == "1"
+    if use_embeddings:
+        try:
+            index, dim = _build_faiss_index(texts)
+            _save_faiss(index)
+            _save_backend(KXBackend(name="st_faiss", dim=dim))
+            return {"backend": "st_faiss", "chunks": len(meta), "dim": dim}
+        except Exception as e:
+            # Si falla (tu caso), caemos a TF-IDF
+            _save_backend(KXBackend(name="tfidf", dim=None))
+            # seguimos abajo con tfidf
+
+    # 2) TF-IDF fallback (sin torch)
+    tfidf_obj = _build_tfidf(texts)
+    _save_tfidf(tfidf_obj)
+    _save_backend(KXBackend(name="tfidf", dim=None))
+    return {"backend": "tfidf", "chunks": len(meta), "dim": None}
 
 def search_kx(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
     if not kx_index_exists():
         return []
-    index, meta = load_index()
-    embedder = get_embedder()
-    q = clean_text(query)
-    q_emb = embedder.encode([q], normalize_embeddings=True, show_progress_bar=False)
-    q_emb = np.array(q_emb).astype("float32")
 
-    scores, idxs = index.search(q_emb, top_k)
-    out = []
-    for score, i in zip(scores[0].tolist(), idxs[0].tolist()):
-        if i < 0 or i >= len(meta):
+    meta = _load_meta()
+    backend = _load_backend() or KXBackend(name="tfidf", dim=None)
+
+    if backend.name == "st_faiss" and os.path.exists(_faiss_index_path()):
+        index = _load_faiss()
+        scores, ids = _search_faiss(index, query, top_k)
+    else:
+        tfidf_obj = _load_tfidf()
+        scores, ids = _search_tfidf(tfidf_obj, query, top_k)
+
+    out: List[Dict[str, Any]] = []
+    for score, idx in zip(scores, ids):
+        if idx < 0 or idx >= len(meta):
             continue
-        m = meta[i]
-        out.append({
-            "score": float(score),
-            "doc_name": m.get("doc_name"),
-            "chunk_id": m.get("chunk_id"),
-            "page": m.get("page"),
-            "text": m.get("text"),
-        })
+        m = meta[int(idx)]
+        out.append(
+            {
+                "score": float(score),
+                "doc_name": m.get("doc_name"),
+                "page": m.get("page"),
+                "chunk_id": m.get("chunk_id"),
+                "text": m.get("text"),
+            }
+        )
     return out
