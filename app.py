@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -10,11 +10,7 @@ from dotenv import load_dotenv
 from src import db
 from src.classifier import classify, hard_filter
 from src.kx_pdf import chunk_text, extract_pdf_text, save_uploaded_pdf
-from src.llm import (
-    generate_insights_heuristic,
-    generate_insights_llm,
-    llm_available,
-)
+from src.llm import generate_insights_heuristic, generate_insights_llm, llm_available
 from src.news import fetch_newsapi, fetch_rss, fetch_url_snippet
 from src.rag import build_kx_index, kx_index_exists, search_kx
 from src.scoring import (
@@ -31,15 +27,16 @@ db.init_db()
 
 st.set_page_config(page_title="Acn2Agent · News + KX (PDF)", layout="wide")
 
-st.title("Acn2Agent · News + APIs + KX (PDF)")
-st.caption("Agentic RAG: ingest → enrich(KX) → filter → rank → explain → structured output")
+st.title("Acn2Agent · News + KX (PDF)")
+st.caption("Buscar → enriquecer (KX) → filtrar → rankear → output estructurado")
 
 # ---------------- sidebar config ----------------
 st.sidebar.header("Configuración")
 
+# Feeds más fiables por defecto (evito Reuters por fallos frecuentes en RSS)
 default_feeds = [
-    "https://www.reuters.com/rssFeed/technologyNews",
     "https://feeds.bbci.co.uk/news/technology/rss.xml",
+    "https://feeds.bbci.co.uk/news/business/rss.xml",
     "https://www.theverge.com/rss/index.xml",
 ]
 feeds_text = st.sidebar.text_area(
@@ -52,7 +49,7 @@ rss_feeds = [f.strip() for f in feeds_text.splitlines() if f.strip()]
 use_newsapi = st.sidebar.checkbox("Usar NewsAPI (opcional)", value=False)
 newsapi_query = st.sidebar.text_input(
     "NewsAPI query",
-    value="Accenture OR artificial intelligence OR cloud regulation",
+    value="Accenture OR consulting OR artificial intelligence OR cloud regulation",
 )
 news_limit = st.sidebar.slider("Máx noticias por fuente", 10, 200, 50, 10)
 
@@ -96,7 +93,7 @@ enrich_with_url = st.sidebar.checkbox(
 # Filtro mínimo (hard filter)
 st.sidebar.subheader("Filtro mínimo")
 must_terms_txt = st.sidebar.text_area(
-    "Debe contener al menos uno (uno por línea)",
+    "Debe contener al menos uno (uno por línea). Vacío = sin filtro.",
     value="Accenture\ndeloitte\npwc\ney\nkpmg\naws\nazure\nopenai",
     height=120,
 )
@@ -178,7 +175,10 @@ def normalize_and_store(news_items: List[Dict[str, Any]]) -> List[Dict[str, Any]
         stored.append(norm)
     return stored
 
-def run_pipeline() -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Returns: (top_results, diagnostics)
+    """
     diag: Dict[str, Any] = {
         "rss_feeds": rss_feeds,
         "rss_items": 0,
@@ -187,6 +187,8 @@ def run_pipeline() -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "kept_after_filter": 0,
         "dropped_after_filter": 0,
         "drop_reasons": {},
+        "kx_index_exists": bool(kx_index_exists()),
+        "must_terms": must_terms,
     }
 
     # 1) Ingesta
@@ -199,9 +201,9 @@ def run_pipeline() -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
     ingested = normalize_and_store(rss_items + api_items)
     diag["ingested_total"] = len(ingested)
 
+    # 2) Filtrado + enriquecimiento + scoring
     results: List[Dict[str, Any]] = []
 
-    # 2) Filtrado + enriquecimiento + scoring
     for it in ingested:
         keep, drop_reason = hard_filter(it, must_have_any=must_terms)
         if not keep:
@@ -211,14 +213,21 @@ def run_pipeline() -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
 
         diag["kept_after_filter"] += 1
 
-        query = f"{it.get('title','')} {it.get('summary','')}".strip()
+        query = f"{it.get('title', '')} {it.get('summary', '')}".strip()
 
+        # KX enrichment (RAG)
         kx_hits = search_kx(query, top_k=top_k_kx) if kx_index_exists() else []
+
+        # Clasificación (tendencia/alcance/mercado/servicio)
         classif = classify(it)
 
+        # Score base
         base_score, base_comps, tags = score_news_item(it, kx_hits, weights, kw_list, ent_list)
+
+        # Score dimensiones (scope/trend/market/service)
         dim_scores = score_dimensions_boost(classif, boosts={})
 
+        # Mezcla final (75% base, 25% dimensiones)
         final_score = 0.75 * base_score + 0.25 * (
             0.25 * dim_scores["scope"]
             + 0.25 * dim_scores["trend"]
@@ -226,6 +235,7 @@ def run_pipeline() -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
             + 0.25 * dim_scores["service"]
         )
 
+        # Explicación estructurada
         if use_llm and llm_available():
             insights = generate_insights_llm(it, kx_hits)
         else:
@@ -235,28 +245,156 @@ def run_pipeline() -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
         por_que = insights.get("por_que_importa", [])
         implicaciones = insights.get("implicaciones_para_accenture", [])
 
-        # blindaje de tipos
+        # Blindaje de tipos
         if not isinstance(por_que, list):
             por_que = [str(por_que)] if por_que else []
         if not isinstance(implicaciones, list):
             implicaciones = [str(implicaciones)] if implicaciones else []
 
-        results.append({
-            **it,
-            "score": float(final_score),
-            "components": {**base_comps, **dim_scores},
-            "classification": classif,
-            "tags": tags,
-            "output": {
-                "descripcion_breve": descripcion,
-                "por_que_importa": por_que,
-                "implicaciones_para_accenture": implicaciones,
-                "link": it.get("url"),
-            },
-            "kx_evidence": kx_hits,
-        })
+        results.append(
+            {
+                **it,
+                "score": float(final_score),
+                "components": {**base_comps, **dim_scores},
+                "classification": classif,
+                "tags": tags,
+                "output": {
+                    "descripcion_breve": descripcion,
+                    "por_que_importa": por_que,
+                    "implicaciones_para_accenture": implicaciones,
+                    "link": it.get("url"),
+                },
+                "kx_evidence": kx_hits,
+            }
+        )
 
     # 3) Ranking
     results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
     return results[:top_n], diag
 
+# ---------------- Run ----------------
+if run_agent:
+    if not rss_feeds and not use_newsapi:
+        st.error("Configura al menos RSS o activa NewsAPI.")
+    else:
+        with st.spinner("Ejecutando agente..."):
+            results, diag = run_pipeline()
+            run_id = str(uuid.uuid4())
+
+            params = {
+                "rss_feeds": rss_feeds,
+                "use_newsapi": use_newsapi,
+                "newsapi_query": newsapi_query,
+                "news_limit": news_limit,
+                "chunk_size": chunk_size,
+                "chunk_overlap": chunk_overlap,
+                "weights": weights,
+                "top_k_kx": top_k_kx,
+                "top_n": top_n,
+                "must_terms": must_terms,
+                "use_llm": use_llm,
+            }
+            db.save_run(run_id, params, results)
+
+            st.session_state["last_results"] = results
+            st.session_state["last_run_id"] = run_id
+            st.session_state["last_diag"] = diag
+
+# ---------------- Results UI ----------------
+results = st.session_state.get("last_results", [])
+run_id = st.session_state.get("last_run_id", None)
+diag = st.session_state.get("last_diag", None)
+
+if diag:
+    with st.expander("Diagnóstico de ingesta / filtros", expanded=True):
+        st.json(diag)
+
+if results:
+    st.success(f"Run completado. run_id={run_id}")
+
+    df = pd.DataFrame(
+        [
+            {
+                "score": r.get("score", 0.0),
+                "title": r.get("title", ""),
+                "source": r.get("source", ""),
+                "published_at": r.get("published_at", ""),
+                "scope": (r.get("classification") or {}).get("scope", ""),
+                "trends": ", ".join((r.get("classification") or {}).get("trends", [])),
+                "markets": ", ".join((r.get("classification") or {}).get("markets", [])),
+                "services": ", ".join((r.get("classification") or {}).get("services", [])),
+                "url": r.get("url", ""),
+                "provider": r.get("provider", ""),
+            }
+            for r in results
+        ]
+    )
+
+    st.subheader("Ranking")
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.subheader("Detalle")
+    titles = [f"{i+1}. [{r.get('score', 0):.1f}] {r.get('title', '')[:110]}" for i, r in enumerate(results)]
+    idx = st.selectbox(
+        "Selecciona una noticia",
+        options=list(range(len(results))),
+        format_func=lambda i: titles[i],
+    )
+
+    item = results[idx]
+    left, right = st.columns([2, 1])
+
+    with left:
+        st.markdown(f"### {item.get('title','')}")
+        st.write(
+            f"**Fuente:** {item.get('source','')}  ·  **Fecha:** {item.get('published_at','')}  ·  **Proveedor:** {item.get('provider','')}"
+        )
+        if item.get("url"):
+            st.link_button("Abrir noticia", item["url"])
+
+        st.markdown("#### Output (resumen estructurado)")
+        output = item.get("output") or {}
+        out_struct = {
+            "titulo": item.get("title", ""),
+            "descripcion_breve": output.get("descripcion_breve", ""),
+            "por_que_importa": output.get("por_que_importa", []),
+            "implicaciones_para_accenture": output.get("implicaciones_para_accenture", []),
+            "link": output.get("link") or item.get("url"),
+            "score_impacto": item.get("score", 0.0),
+        }
+        st.code(safe_json(out_struct), language="json")
+
+        st.markdown("#### Clasificación (tendencia/alcance/mercado/servicio)")
+        st.json(item.get("classification", {}))
+
+        st.markdown("#### Componentes del score")
+        st.json(item.get("components", {}))
+
+    with right:
+        st.markdown("#### Evidencias KX (top-k)")
+        kx = item.get("kx_evidence", [])
+        if not kx:
+            st.info("No hay evidencias KX (o el índice KX no está construido).")
+        else:
+            for h in kx:
+                st.markdown(
+                    f"**Sim:** {h.get('score', 0):.3f} · **Doc:** {h.get('doc_name', 'KX')} · **Page:** {h.get('page', '?')}"
+                )
+                st.caption((h.get("text", "") or "")[:700])
+
+    st.subheader("Export")
+    st.download_button(
+        "Descargar resultados (JSON)",
+        data=safe_json(results),
+        file_name=f"acn2agent_results_{run_id}.json",
+        mime="application/json",
+    )
+
+else:
+    st.warning("No hay noticias para mostrar. Pulsa 'Run Agent' y revisa el diagnóstico.")
+    if diag:
+        st.write("Pistas rápidas:")
+        st.write(f"- RSS items: {diag.get('rss_items')}")
+        st.write(f"- NewsAPI items: {diag.get('newsapi_items')}")
+        st.write(f"- Ingestadas: {diag.get('ingested_total')}")
+        st.write(f"- Tras filtro: {diag.get('kept_after_filter')}")
