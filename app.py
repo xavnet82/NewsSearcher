@@ -26,12 +26,31 @@ from src.utils import clean_text, safe_json, sha1
 
 # ---------------- init ----------------
 load_dotenv()
-db.init_db()
 
 st.set_page_config(page_title="Acn2Agent · Accenture News + KX (PDF)", layout="wide")
-
 st.title("Acn2Agent · Accenture News + KX (PDF)")
 st.caption("Buscar (Google News RSS) → enriquecer (KX) → filtrar → rankear → output estructurado")
+
+
+# ---------------- session-state safe helpers ----------------
+def ss_get(key: str, default):
+    """
+    Evita 'Tried to use SessionInfo before it was initialized' en entornos donde
+    la sesión aún no está lista.
+    """
+    try:
+        if key not in st.session_state:
+            st.session_state[key] = default
+        return st.session_state[key]
+    except Exception:
+        return default
+
+
+def ss_set(key: str, value) -> None:
+    try:
+        st.session_state[key] = value
+    except Exception:
+        pass
 
 
 # ---------------- UI helpers ----------------
@@ -58,7 +77,6 @@ def bullets(items: List[str]) -> str:
         return "—"
     safe_lines: List[str] = []
     for x in items:
-        # Evitar saltos de línea y escapar HTML
         s = str(x).replace("\n", " ").strip()
         safe_lines.append(f"• {html.escape(s)}")
     return "<br/>".join(safe_lines)
@@ -75,7 +93,6 @@ def build_google_news_rss_urls(queries: List[str], hl: str, gl: str, ceid: str) 
 # ---------------- sidebar config ----------------
 st.sidebar.header("Configuración")
 
-# 1) Google News RSS (búsqueda)
 st.sidebar.subheader("Google News (RSS por búsqueda)")
 use_gnews = st.sidebar.checkbox("Usar Google News Search RSS", value=True)
 
@@ -105,7 +122,6 @@ elif gnews_region == "US (english)":
 else:
     hl, gl, ceid = "en-GB", "GB", "GB:en"
 
-# 2) RSS generales (opcional)
 st.sidebar.subheader("RSS generales (opcional)")
 default_feeds = [
     "https://feeds.bbci.co.uk/news/business/rss.xml",
@@ -115,7 +131,6 @@ default_feeds = [
 feeds_text = st.sidebar.text_area("RSS feeds (uno por línea)", value="\n".join(default_feeds), height=120)
 rss_feeds = [f.strip() for f in feeds_text.splitlines() if f.strip()]
 
-# 3) NewsAPI (opcional)
 st.sidebar.subheader("NewsAPI (opcional)")
 use_newsapi = st.sidebar.checkbox("Usar NewsAPI", value=False)
 newsapi_query = st.sidebar.text_input(
@@ -147,10 +162,8 @@ st.sidebar.divider()
 st.sidebar.subheader("Filtros / ranking")
 top_k_kx = st.sidebar.slider("Top K evidencias KX por noticia", 1, 10, 5, 1)
 top_n = st.sidebar.slider("Top N noticias en ranking", 5, 50, 20, 5)
-
 enrich_with_url = st.sidebar.checkbox("Intentar extraer snippet desde URL si falta resumen", value=True)
 
-# Hard filter
 st.sidebar.subheader("Filtro mínimo (hard filter)")
 st.sidebar.caption("Si se queda en 0, deja esto vacío para depurar.")
 must_terms_txt = st.sidebar.text_area(
@@ -164,8 +177,6 @@ st.sidebar.divider()
 st.sidebar.subheader("LLM (opcional)")
 use_llm = st.sidebar.checkbox("Generar insights con LLM (requiere OPENAI_API_KEY)", value=False)
 st.sidebar.caption(f"LLM disponible: {'Sí' if llm_available() else 'No'}")
-
-# Control de coste/latencia
 MAX_LLM_CALLS = st.sidebar.slider("Máx llamadas LLM por ejecución", 0, 20, 5, 1)
 
 run_agent = st.sidebar.button("▶ Run Agent", type="primary")
@@ -205,11 +216,18 @@ if uploaded and st.button("📚 Construir / Re-construir índice KX", type="seco
 
 st.divider()
 
-# ---------------- Agent pipeline ----------------
 st.subheader("2) Ejecutar agente (news + KX)")
 
 
+# ---------------- pipeline helpers ----------------
 def normalize_and_store(news_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    # init DB sólo cuando ya hay runtime UI (evita algunos fallos de session)
+    try:
+        db.init_db()
+    except Exception as e:
+        st.error(f"Error inicializando DB: {e}")
+        st.stop()
+
     stored: List[Dict[str, Any]] = []
     for it in news_items:
         title = clean_text(it.get("title", ""))
@@ -239,7 +257,7 @@ def normalize_and_store(news_items: List[Dict[str, Any]]) -> List[Dict[str, Any]
 
 
 def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    llm_calls = 0  # dentro de la función
+    llm_calls = 0
 
     diag: Dict[str, Any] = {
         "rss_feeds_count": len(rss_feeds),
@@ -261,6 +279,7 @@ def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "llm_calls_used": 0,
     }
 
+    # Ingesta
     rss_items = fetch_rss(rss_feeds, max_items=news_limit) if rss_feeds else []
     diag["rss_items"] = len(rss_items)
 
@@ -292,17 +311,19 @@ def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         diag["kept_after_filter"] += 1
         query = f"{it.get('title','')} {it.get('summary','')}".strip()
 
+        # KX enrichment
         try:
             kx_hits = search_kx(query, top_k=top_k_kx) if kx_index_exists() else []
         except Exception as e:
             diag["kx_error"] = str(e)
             kx_hits = []
 
+        # Clasificación
         classif = classify(it)
 
+        # Score
         base_score, base_comps, tags = score_news_item(it, kx_hits, weights, kw_list, ent_list)
         dim_scores = score_dimensions_boost(classif, boosts={})
-
         final_score = 0.75 * base_score + 0.25 * (
             0.25 * dim_scores["scope"]
             + 0.25 * dim_scores["trend"]
@@ -310,8 +331,8 @@ def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             + 0.25 * dim_scores["service"]
         )
 
+        # Insights
         use_llm_now = use_llm and llm_available() and llm_calls < int(MAX_LLM_CALLS)
-
         try:
             if use_llm_now:
                 insights = generate_insights_llm(it, kx_hits)
@@ -368,17 +389,21 @@ if run_agent:
                 "max_llm_calls": int(MAX_LLM_CALLS),
             }
 
-            db.save_run(run_id, params, results)
+            # guardado persistente best-effort
+            try:
+                db.save_run(run_id, params, results)
+            except Exception as e:
+                diag["db_save_error"] = str(e)
 
-            st.session_state["last_results"] = results
-            st.session_state["last_run_id"] = run_id
-            st.session_state["last_diag"] = diag
+            ss_set("last_results", results)
+            ss_set("last_run_id", run_id)
+            ss_set("last_diag", diag)
 
 
 # ---------------- Results UI ----------------
-results = st.session_state.get("last_results", [])
-run_id = st.session_state.get("last_run_id", None)
-diag = st.session_state.get("last_diag", None)
+results = ss_get("last_results", [])
+run_id = ss_get("last_run_id", None)
+diag = ss_get("last_diag", None)
 
 if diag:
     with st.expander("Diagnóstico de ingesta / filtros", expanded=True):
@@ -410,9 +435,9 @@ if results:
 
     st.subheader("Detalle")
     titles = [f"{i+1}. [{r.get('score', 0):.1f}] {r.get('title', '')[:110]}" for i, r in enumerate(results)]
-    idx = st.selectbox("Selecciona una noticia", options=list(range(len(results))), format_func=lambda i: titles[i])
+    sel = st.selectbox("Selecciona una noticia", options=list(range(len(results))), format_func=lambda i: titles[i])
+    item = results[int(sel)]
 
-    item = results[idx]
     left, right = st.columns([2, 1])
 
     with left:
@@ -480,7 +505,6 @@ if results:
         file_name=f"acn2agent_results_{run_id}.json",
         mime="application/json",
     )
-
 else:
     st.warning("No hay noticias para mostrar. Pulsa 'Run Agent' y revisa el diagnóstico.")
     if diag:
