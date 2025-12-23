@@ -1,9 +1,3 @@
-
----
-
-## `app.py`
-
-```python
 from __future__ import annotations
 import uuid
 from typing import Any, Dict, List
