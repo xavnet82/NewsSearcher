@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import html
 import uuid
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import pandas as pd
 import requests
@@ -24,20 +24,21 @@ from src.scoring import (
 )
 from src.utils import clean_text, safe_json, sha1
 
-# ---------------- init ----------------
-load_dotenv()
+# --- Streamlit context guard (evita SessionInfo before initialized) ---
+def has_st_ctx() -> bool:
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        return get_script_run_ctx() is not None
+    except Exception:
+        return False
 
-st.set_page_config(page_title="Acn2Agent · Accenture News + KX (PDF)", layout="wide")
-st.title("Acn2Agent · Accenture News + KX (PDF)")
-st.caption("Buscar (Google News RSS) → enriquecer (KX) → filtrar → rankear → output estructurado")
 
-
-# ---------------- session-state safe helpers ----------------
 def ss_get(key: str, default):
     """
-    Evita 'Tried to use SessionInfo before it was initialized' en entornos donde
-    la sesión aún no está lista.
+    Accesso seguro a session_state: si no hay contexto de sesión, devuelve default.
     """
+    if not has_st_ctx():
+        return default
     try:
         if key not in st.session_state:
             st.session_state[key] = default
@@ -47,10 +48,32 @@ def ss_get(key: str, default):
 
 
 def ss_set(key: str, value) -> None:
+    if not has_st_ctx():
+        return
     try:
         st.session_state[key] = value
     except Exception:
         pass
+
+
+def ui_progress(initial: float = 0.0):
+    """
+    Barra de progreso segura: si no hay ctx, devuelve None.
+    """
+    if not has_st_ctx():
+        return None
+    try:
+        return st.progress(initial)
+    except Exception:
+        return None
+
+
+# ---------------- init ----------------
+load_dotenv()
+
+st.set_page_config(page_title="Acn2Agent · Accenture News + KX (PDF)", layout="wide")
+st.title("Acn2Agent · Accenture News + KX (PDF)")
+st.caption("Buscar (Google News RSS) → enriquecer (KX) → filtrar → rankear → output estructurado")
 
 
 # ---------------- UI helpers ----------------
@@ -215,18 +238,13 @@ if uploaded and st.button("📚 Construir / Re-construir índice KX", type="seco
             st.error(f"Error construyendo índice KX: {e}")
 
 st.divider()
-
 st.subheader("2) Ejecutar agente (news + KX)")
 
 
 # ---------------- pipeline helpers ----------------
 def normalize_and_store(news_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    # init DB sólo cuando ya hay runtime UI (evita algunos fallos de session)
-    try:
-        db.init_db()
-    except Exception as e:
-        st.error(f"Error inicializando DB: {e}")
-        st.stop()
+    # Importante: nada de st.* aquí. Si falla DB, levantamos excepción.
+    db.init_db()
 
     stored: List[Dict[str, Any]] = []
     for it in news_items:
@@ -279,7 +297,6 @@ def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "llm_calls_used": 0,
     }
 
-    # Ingesta
     rss_items = fetch_rss(rss_feeds, max_items=news_limit) if rss_feeds else []
     diag["rss_items"] = len(rss_items)
 
@@ -296,11 +313,16 @@ def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     diag["ingested_total"] = len(ingested)
 
     results: List[Dict[str, Any]] = []
-    progress = st.progress(0.0)
 
+    pbar = ui_progress(0.0)
     total = max(1, len(ingested))
+
     for i, it in enumerate(ingested):
-        progress.progress(min(1.0, (i + 1) / total))
+        if pbar is not None:
+            try:
+                pbar.progress(min(1.0, (i + 1) / total))
+            except Exception:
+                pass
 
         keep, drop_reason = hard_filter(it, must_have_any=must_terms)
         if not keep:
@@ -311,19 +333,17 @@ def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         diag["kept_after_filter"] += 1
         query = f"{it.get('title','')} {it.get('summary','')}".strip()
 
-        # KX enrichment
         try:
             kx_hits = search_kx(query, top_k=top_k_kx) if kx_index_exists() else []
         except Exception as e:
             diag["kx_error"] = str(e)
             kx_hits = []
 
-        # Clasificación
         classif = classify(it)
 
-        # Score
         base_score, base_comps, tags = score_news_item(it, kx_hits, weights, kw_list, ent_list)
         dim_scores = score_dimensions_boost(classif, boosts={})
+
         final_score = 0.75 * base_score + 0.25 * (
             0.25 * dim_scores["scope"]
             + 0.25 * dim_scores["trend"]
@@ -331,7 +351,6 @@ def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             + 0.25 * dim_scores["service"]
         )
 
-        # Insights
         use_llm_now = use_llm and llm_available() and llm_calls < int(MAX_LLM_CALLS)
         try:
             if use_llm_now:
@@ -357,7 +376,12 @@ def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             }
         )
 
-    progress.empty()
+    if pbar is not None:
+        try:
+            pbar.empty()
+        except Exception:
+            pass
+
     results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
     return results[:top_n], diag
 
@@ -367,37 +391,41 @@ if run_agent:
     if (not rss_feeds) and (not use_gnews) and (not use_newsapi):
         st.error("Activa al menos una fuente: Google News RSS, RSS generales o NewsAPI.")
     else:
-        with st.spinner("Ejecutando agente..."):
-            results, diag = run_pipeline()
-            run_id = str(uuid.uuid4())
+        try:
+            with st.spinner("Ejecutando agente..."):
+                results, diag = run_pipeline()
+        except Exception as e:
+            st.error(f"Error ejecutando pipeline: {e}")
+            results, diag = [], {"pipeline_error": str(e)}
 
-            params = {
-                "rss_feeds": rss_feeds,
-                "use_gnews": use_gnews,
-                "gnews_region": {"hl": hl, "gl": gl, "ceid": ceid},
-                "gnews_queries": gnews_queries,
-                "use_newsapi": use_newsapi,
-                "newsapi_query": newsapi_query,
-                "news_limit": news_limit,
-                "chunk_size": chunk_size,
-                "chunk_overlap": chunk_overlap,
-                "weights": weights,
-                "top_k_kx": top_k_kx,
-                "top_n": top_n,
-                "must_terms": must_terms,
-                "use_llm": use_llm,
-                "max_llm_calls": int(MAX_LLM_CALLS),
-            }
+        run_id = str(uuid.uuid4())
 
-            # guardado persistente best-effort
-            try:
-                db.save_run(run_id, params, results)
-            except Exception as e:
-                diag["db_save_error"] = str(e)
+        params = {
+            "rss_feeds": rss_feeds,
+            "use_gnews": use_gnews,
+            "gnews_region": {"hl": hl, "gl": gl, "ceid": ceid},
+            "gnews_queries": gnews_queries,
+            "use_newsapi": use_newsapi,
+            "newsapi_query": newsapi_query,
+            "news_limit": news_limit,
+            "chunk_size": chunk_size,
+            "chunk_overlap": chunk_overlap,
+            "weights": weights,
+            "top_k_kx": top_k_kx,
+            "top_n": top_n,
+            "must_terms": must_terms,
+            "use_llm": use_llm,
+            "max_llm_calls": int(MAX_LLM_CALLS),
+        }
 
-            ss_set("last_results", results)
-            ss_set("last_run_id", run_id)
-            ss_set("last_diag", diag)
+        try:
+            db.save_run(run_id, params, results)
+        except Exception as e:
+            diag["db_save_error"] = str(e)
+
+        ss_set("last_results", results)
+        ss_set("last_run_id", run_id)
+        ss_set("last_diag", diag)
 
 
 # ---------------- Results UI ----------------
