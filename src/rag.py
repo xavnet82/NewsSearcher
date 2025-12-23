@@ -8,9 +8,22 @@ from sentence_transformers import SentenceTransformer
 
 from .utils import env, clean_text
 
+from functools import lru_cache
+from sentence_transformers import SentenceTransformer
+from src.utils import env
+
+@lru_cache(maxsize=1)
 def get_embedder() -> SentenceTransformer:
     model_name = env("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-    return SentenceTransformer(model_name)
+
+    # Forzamos CPU explícitamente. Evita caminos raros de device/meta.
+    embedder = SentenceTransformer(
+        model_name,
+        device="cpu",
+        trust_remote_code=False,
+    )
+    return embedder
+
 
 def ensure_faiss_dir() -> str:
     d = env("FAISS_DIR", "data/faiss")
