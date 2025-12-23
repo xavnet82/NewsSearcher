@@ -142,25 +142,60 @@ def run_pipeline() -> List[Dict[str, Any]]:
     api_items = fetch_newsapi(newsapi_query, page_size=news_limit) if use_newsapi else []
     ingested = normalize_and_store(rss_items + api_items)
 
-    results = []
-    for it in ingested:
-        query = f"{it.get('title','')} {it.get('summary','')}".strip()
-        kx_hits = search_kx(query, top_k=top_k_kx) if kx_index_exists() else []
-        score, comps, tags = score_news_item(it, kx_hits, weights, kw_list, ent_list)
+results = []
+for it in ingested:
+    keep, drop_reason = hard_filter(it, must_have_any=must_terms)
+    if not keep:
+        continue
 
-        if use_llm and llm_available():
-            insights = generate_insights_llm(it, kx_hits)
-        else:
-            insights = generate_insights_heuristic(it, kx_hits)
+    query = f"{it.get('title','')} {it.get('summary','')}".strip()
 
-        results.append({
-            **it,
-            "score": float(score),
-            "components": comps,
-            "tags": tags,
-            "insights": insights,
-            "kx_evidence": kx_hits,
-        })
+    # KX enrichment
+    kx_hits = search_kx(query, top_k=top_k_kx) if kx_index_exists() else []
+
+    # Classify (trend/scope/market/service)
+    classif = classify(it)
+
+    # Base score (recency/entity/keyword/kx)
+    base_score, base_comps, tags = score_news_item(it, kx_hits, weights, kw_list, ent_list)
+
+    # Dimension boosts
+    dim_scores = score_dimensions_boost(classif, boosts={})
+    # Mezcla simple (peso extra configurable si quieres)
+    final_score = 0.75 * base_score + 0.25 * (
+        0.25 * dim_scores["scope"] +
+        0.25 * dim_scores["trend"] +
+        0.25 * dim_scores["market"] +
+        0.25 * dim_scores["service"]
+    )
+
+    # Explain
+    if use_llm and llm_available():
+        insights = generate_insights_llm(it, kx_hits)
+        descripcion = insights.get("descripcion", "")
+        por_que = insights.get("por_que_importa", [])
+        implicaciones = insights.get("implicaciones_para_accenture", [])
+    else:
+        insights = generate_insights_heuristic(it, kx_hits)
+        descripcion = insights.get("descripcion", "")
+        por_que = insights.get("por_que_importa", [])
+        implicaciones = insights.get("implicaciones_para_accenture", [])
+
+    results.append({
+        **it,
+        "score": float(final_score),
+        "components": {**base_comps, **dim_scores},
+        "classification": classif,
+        "tags": tags,
+        "output": {
+            "descripcion_breve": descripcion,
+            "por_que_importa": por_que,
+            "implicaciones_para_accenture": implicaciones,
+            "link": it.get("url"),
+        },
+        "kx_evidence": kx_hits,
+    })
+
 
     results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
     return results[:top_n]
