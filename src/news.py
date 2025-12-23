@@ -89,3 +89,11 @@ def fetch_url_snippet(url: str, timeout: int = 12) -> str:
         return combined[:1200]
     except Exception:
         return ""
+
+def fetch_google_news_rss(queries: list[str], hl: str, gl: str, ceid: str, max_items: int = 50):
+    feeds = []
+    for q in queries:
+        q_enc = requests.utils.quote(q)
+        feeds.append(f"https://news.google.com/rss/search?q={q_enc}&hl={hl}&gl={gl}&ceid={ceid}")
+
+    return fetch_rss(feeds, max_items=max_items)
