@@ -290,10 +290,21 @@ def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
 
         # Explicación estructurada (LLM o heurística)
         try:
-            if use_llm and llm_available():
-                insights = generate_insights_llm(it, kx_hits)
+            use_llm_now = (
+                use_llm
+                and llm_available()
+                and llm_calls < MAX_LLM_CALLS
+            )
+            
+            if use_llm_now:
+                try:
+                    insights = generate_insights_llm(it, kx_hits)
+                    llm_calls += 1
+                except Exception as e:
+                    insights = generate_insights_heuristic(it, kx_hits)
             else:
                 insights = generate_insights_heuristic(it, kx_hits)
+
         except Exception as e:
             # Si el LLM falla, no rompemos el run; degradamos a heurístico y lo reflejamos en diag
             diag["llm_error"] = str(e)
