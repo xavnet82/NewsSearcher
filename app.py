@@ -1,6 +1,7 @@
 # app.py
 from __future__ import annotations
 
+import html
 import uuid
 from typing import Any, Dict, List, Tuple
 
@@ -44,7 +45,7 @@ def card(title: str, body_html: str) -> None:
             margin: 8px 0;
             background: rgba(255,255,255,0.02);
         ">
-          <div style="font-weight: 700; font-size: 16px; margin-bottom: 8px;">{title}</div>
+          <div style="font-weight: 700; font-size: 16px; margin-bottom: 8px;">{html.escape(title)}</div>
           <div style="font-size: 14px; line-height: 1.45;">{body_html}</div>
         </div>
         """,
@@ -55,7 +56,12 @@ def card(title: str, body_html: str) -> None:
 def bullets(items: List[str]) -> str:
     if not items:
         return "—"
-    return "<br/>".join([f"• {st._utils.escape_markdown(str(x)).replace('\\n',' ')}" for x in items])  # safe-ish
+    safe_lines: List[str] = []
+    for x in items:
+        # Evitar saltos de línea y escapar HTML
+        s = str(x).replace("\n", " ").strip()
+        safe_lines.append(f"• {html.escape(s)}")
+    return "<br/>".join(safe_lines)
 
 
 def build_google_news_rss_urls(queries: List[str], hl: str, gl: str, ceid: str) -> List[str]:
@@ -233,7 +239,7 @@ def normalize_and_store(news_items: List[Dict[str, Any]]) -> List[Dict[str, Any]
 
 
 def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    llm_calls = 0  # <-- IMPORTANTE: dentro de la función
+    llm_calls = 0  # dentro de la función
 
     diag: Dict[str, Any] = {
         "rss_feeds_count": len(rss_feeds),
@@ -255,7 +261,6 @@ def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "llm_calls_used": 0,
     }
 
-    # 1) Ingesta
     rss_items = fetch_rss(rss_feeds, max_items=news_limit) if rss_feeds else []
     diag["rss_items"] = len(rss_items)
 
@@ -271,13 +276,12 @@ def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     ingested = normalize_and_store(rss_items + gnews_items + api_items)
     diag["ingested_total"] = len(ingested)
 
-    # 2) Filtrado + enriquecimiento + scoring
     results: List[Dict[str, Any]] = []
     progress = st.progress(0.0)
 
     total = max(1, len(ingested))
-    for idx, it in enumerate(ingested):
-        progress.progress(min(1.0, (idx + 1) / total))
+    for i, it in enumerate(ingested):
+        progress.progress(min(1.0, (i + 1) / total))
 
         keep, drop_reason = hard_filter(it, must_have_any=must_terms)
         if not keep:
@@ -288,23 +292,17 @@ def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         diag["kept_after_filter"] += 1
         query = f"{it.get('title','')} {it.get('summary','')}".strip()
 
-        # KX enrichment (no tumbar el run)
         try:
             kx_hits = search_kx(query, top_k=top_k_kx) if kx_index_exists() else []
         except Exception as e:
             diag["kx_error"] = str(e)
             kx_hits = []
 
-        # Clasificación
         classif = classify(it)
 
-        # Score base
         base_score, base_comps, tags = score_news_item(it, kx_hits, weights, kw_list, ent_list)
-
-        # Score dimensiones
         dim_scores = score_dimensions_boost(classif, boosts={})
 
-        # Score final
         final_score = 0.75 * base_score + 0.25 * (
             0.25 * dim_scores["scope"]
             + 0.25 * dim_scores["trend"]
@@ -312,7 +310,6 @@ def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             + 0.25 * dim_scores["service"]
         )
 
-        # Insights (LLM limitado + fallback)
         use_llm_now = use_llm and llm_available() and llm_calls < int(MAX_LLM_CALLS)
 
         try:
@@ -334,13 +331,12 @@ def run_pipeline() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
                 "components": {**base_comps, **dim_scores},
                 "classification": classif,
                 "tags": tags,
-                "output": insights,  # <-- IMPORTANTE: output ya incluye KX enrichment y evidencias
+                "output": insights,
                 "kx_evidence": kx_hits,
             }
         )
 
     progress.empty()
-
     results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
     return results[:top_n], diag
 
@@ -428,8 +424,9 @@ if results:
             st.link_button("Abrir noticia", item["url"])
 
         output = item.get("output") or {}
+
         st.markdown("#### Resumen (alineado al reto)")
-        card("Descripción breve", (output.get("descripcion_breve", "") or "—"))
+        card("Descripción breve", html.escape(output.get("descripcion_breve", "") or "—"))
 
         why = output.get("por_que_importa") or []
         card("Por qué importa", bullets([str(x) for x in why]))
@@ -439,7 +436,7 @@ if results:
 
         kx_enr = output.get("kx_enriquecimiento") or {}
         kx_body = (kx_enr.get("resumen_contexto") or "").strip() or "—"
-        card("Enriquecimiento KX (contexto interno)", kx_body)
+        card("Enriquecimiento KX (contexto interno)", html.escape(kx_body))
 
         evs = kx_enr.get("evidencias") or []
         if evs:
@@ -450,7 +447,6 @@ if results:
         else:
             st.info("No hay evidencias KX citadas en el output (o no existe índice KX).")
 
-        # Cards: principales drivers del score
         comps = item.get("components") or {}
         keys_order = ["recency", "entity", "keyword", "kx", "scope", "trend", "market", "service"]
         lines: List[Tuple[str, float]] = []
@@ -462,10 +458,7 @@ if results:
                     pass
         lines.sort(key=lambda x: x[1], reverse=True)
         top_lines = lines[:6]
-        if top_lines:
-            body = "<br/>".join([f"<b>{k}:</b> {v:.1f}" for k, v in top_lines])
-        else:
-            body = "—"
+        body = "<br/>".join([f"<b>{html.escape(k)}:</b> {v:.1f}" for k, v in top_lines]) if top_lines else "—"
         card("Componentes del score (top drivers)", body)
 
     with right:
